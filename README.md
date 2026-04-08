@@ -5,7 +5,7 @@
 `zfsbox` is a host-side wrapper around a Linux ZFS environment.
 
 - On **macOS**, it currently runs ZFS inside a **Lima `vz` guest** and mounts pool roots back onto the host at `/Volumes/<pool>`.
-- On **Linux**, the repo still contains the original **Firecracker + Docker** scaffold and guest-control tooling.
+- On **Linux**, it now prefers a **rootless QEMU guest** with host path passthrough and automatic host mounts under `/mnt/<pool>`.
 
 The current sweet spot is:
 
@@ -18,10 +18,12 @@ The current sweet spot is:
 
 - Host-side `zpool` and `zfs` wrappers
 - macOS-backed pools using host files under `${HOME}` or `/Volumes`
+- Linux-backed pools using arbitrary absolute host paths under `/`
 - automatic host mounts at `/Volumes/<pool>` on macOS
+- automatic host mounts at `/mnt/<pool>` on Linux
 - visible `.zfs/snapshot` trees on host mounts
 - snapshot / clone / send / receive workflows through real ZFS tooling
-- no Docker required on macOS
+- no Docker required on macOS or Linux
 
 ## 🧭 Architecture
 
@@ -40,13 +42,11 @@ macOS
 
 ```text
 Linux
-  -> Docker
-    -> Firecracker scaffold
-      -> Ubuntu guest
-        -> OpenZFS
+  -> QEMU (rootless, /dev/kvm when available)
+    -> Ubuntu guest
+      -> OpenZFS
+        -> NFSv4 back to /mnt/<pool>
 ```
-
-The macOS path is the most complete path in this repo right now.
 
 ## 🚀 Quick Start
 
@@ -72,13 +72,24 @@ zpool create test ~/Desktop/testpool.zpool
 ```
 
 On macOS, the first mutating command may ask for Touch ID because `zfsbox` mounts pool roots under `/Volumes`.
+On Linux, `zfsbox` keeps the VM itself rootless and only uses `sudo` when it needs to prepare `/mnt/<pool>`.
 
 ### 4. Use it from the host
+
+macOS:
 
 ```bash
 ls -la /Volumes/test
 echo hello > /Volumes/test/test.txt
 cat /Volumes/test/test.txt
+```
+
+Linux:
+
+```bash
+ls -la /mnt/test
+echo hello > /mnt/test/test.txt
+cat /mnt/test/test.txt
 ```
 
 ## 📸 Snapshots
@@ -95,12 +106,11 @@ Create a snapshot:
 zfs snapshot test@one
 ```
 
-Browse it from macOS:
+Browse it from the host:
 
 ```bash
-ls -la /Volumes/test/.zfs/snapshot
-ls -la /Volumes/test/.zfs/snapshot/one
-cat /Volumes/test/.zfs/snapshot/one/test.txt
+ls -la /Volumes/test/.zfs/snapshot   # macOS
+ls -la /mnt/test/.zfs/snapshot       # Linux
 ```
 
 ## 🧪 Common Workflows
@@ -115,7 +125,8 @@ zpool create media ~/Desktop/media.zpool
 It should appear at:
 
 ```bash
-/Volumes/media
+/Volumes/media  # macOS
+/mnt/media      # Linux
 ```
 
 ### Clone from a snapshot
@@ -162,28 +173,32 @@ zfs list
 - [`bin/zfsbox-zpool`](./bin/zfsbox-zpool): host-side `zpool` wrapper
 - [`bin/zfsbox-zfs`](./bin/zfsbox-zfs): host-side `zfs` wrapper
 - [`scripts/macos-lima-zfs-exec.sh`](./scripts/macos-lima-zfs-exec.sh): macOS Lima execution path
-- [`scripts/reconcile-host-mounts.sh`](./scripts/reconcile-host-mounts.sh): exports guest filesystems and mounts them on the host
+- [`scripts/linux-qemu-zfs-exec.sh`](./scripts/linux-qemu-zfs-exec.sh): Linux rootless QEMU execution path
+- [`scripts/reconcile-host-mounts.sh`](./scripts/reconcile-host-mounts.sh): mounts guest filesystems back onto the host
 - [`zfsbox.aliases.sh`](./zfsbox.aliases.sh): shell aliases / functions
 
 ## ⚠️ Notes
 
 - macOS currently uses **Lima directly**, not Firecracker, because Firecracker requires a Linux/KVM path and this machine rejected nested virtualization for the old macOS route.
 - Host-backed file vdevs must live under paths mounted into the guest. The current macOS wrapper exposes `${HOME}` and `/Volumes`.
-- Host-visible pool mounts are implemented with **guest-side NFS**.
+- The current Linux wrapper shares host `/` into the guest once and rewrites absolute host paths to `/host/...` automatically.
+- Host-visible pool mounts are implemented with **guest-side NFS** on macOS and **guest-side NFSv4 over localhost port forwarding** on Linux.
 - macOS host mountpoints under `/Volumes/<pool>` may require re-auth with Touch ID when reconciling mounts.
-- The Linux Firecracker scaffold is still in the repo, but the macOS Lima path is the tested one.
+- On Linux, `/dev/kvm` is optional for acceleration but not required for correctness; `/mnt/<pool>` preparation is the only step that needs `sudo`.
+- The current rootless Linux runner is implemented for `x86_64` hosts first and expects `qemu-system-x86_64`, `qemu-img`, one cloud-init seed-image builder, and host NFS client tools.
 
 ## 📚 References
 
 - [Lima `vz` docs](https://lima-vm.io/docs/config/vmtype/vz/)
 - [Lima networking docs](https://lima-vm.io/docs/config/network/)
 - [Firecracker](https://github.com/firecracker-microvm/firecracker)
+- [QEMU invocation docs](https://www.qemu.org/docs/master/system/invocation.html)
 - [OpenZFS documentation](https://openzfs.github.io/openzfs-docs/)
 - [ZFS `snapdir` property](https://openzfs.github.io/openzfs-docs/man/master/7/zfsprops.7.html)
 
 ## 🗺 Roadmap
 
-- make Linux host mounts mirror the macOS `/Volumes/<pool>` experience under `/mnt/<pool>`
+- improve the Linux guest share transport beyond the current rootless QEMU baseline
 - improve stale mount cleanup and mount-state reporting
 - support more explicit backing-store helpers for multi-pool workflows
 - revisit Firecracker on macOS only if a host-compatible Linux/KVM substrate is consistently available

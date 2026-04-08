@@ -22,6 +22,11 @@ log() {
 
 host_os="$(uname -s)"
 
+if [[ "${host_os}" == "Linux" && -f "${PROJECT_DIR}/scripts/linux-qemu-common.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "${PROJECT_DIR}/scripts/linux-qemu-common.sh"
+fi
+
 case "${host_os}" in
     Darwin)
         managed_state_file="${STATE_DIR}/host-mounts.darwin.txt"
@@ -41,11 +46,7 @@ guest_exec() {
     if [[ "${host_os}" == "Darwin" ]]; then
         limactl --log-level=error -y shell "${LIMA_INSTANCE_NAME}" bash -lc "${script}"
     else
-        (
-            cd "${PROJECT_DIR}"
-            docker compose up -d --build >/dev/null
-            docker compose exec -T zfsbox /opt/zfsbox/scripts/guestctl.sh exec bash -lc "${script}"
-        )
+        linux_qemu_guest_exec bash -lc "${script}"
     fi
 }
 
@@ -61,6 +62,67 @@ guest_sudo_exec() {
 
 ensure_guest_exports() {
     local host_client_q="$1"
+
+    if [[ "${host_os}" == "Linux" ]]; then
+        guest_sudo_exec "
+set -Eeuo pipefail
+
+if command -v apt-get >/dev/null 2>&1 && ! command -v exportfs >/dev/null 2>&1; then
+    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update >/dev/null 2>&1
+    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y nfs-kernel-server >/dev/null 2>&1
+fi
+
+mkdir -p /etc/exports.d /srv/zfsbox/exports
+tmp_exports=\$(mktemp)
+tmp_desired=\$(mktemp)
+
+printf '%s\\n' '/srv/zfsbox/exports *(rw,fsid=0,sync,no_subtree_check,no_root_squash,crossmnt,insecure)' > \"\${tmp_exports}\"
+
+zfs list -H -o name,mountpoint,mounted -t filesystem -d 0 | while IFS=\$'\\t' read -r name mountpoint mounted; do
+    case \"\${mountpoint}\" in
+        legacy|none|-|'')
+            continue
+            ;;
+    esac
+
+    if [[ \"\${mounted}\" != yes ]]; then
+        continue
+    fi
+
+    target=\"/srv/zfsbox/exports/\${name}\"
+    mkdir -p \"\${target}\"
+
+    if mountpoint -q \"\${target}\"; then
+        current_source=\$(findmnt -n -o SOURCE --target \"\${target}\" 2>/dev/null || true)
+        if [[ \"\${current_source}\" != \"\${mountpoint}\" ]]; then
+            umount \"\${target}\" || true
+        fi
+    fi
+
+    if ! mountpoint -q \"\${target}\"; then
+        mount --bind \"\${mountpoint}\" \"\${target}\"
+    fi
+
+    printf '%s\\n' \"\${target}\" >> \"\${tmp_desired}\"
+    printf '%s\\n' \"\${target} *(rw,sync,no_subtree_check,no_root_squash,insecure)\" >> \"\${tmp_exports}\"
+done
+
+find /srv/zfsbox/exports -mindepth 1 -maxdepth 1 -type d | while IFS= read -r path; do
+    if ! grep -Fxq \"\${path}\" \"\${tmp_desired}\"; then
+        if mountpoint -q \"\${path}\"; then
+            umount \"\${path}\" || true
+        fi
+        rmdir \"\${path}\" 2>/dev/null || true
+    fi
+done
+
+mv \"\${tmp_exports}\" /etc/exports.d/zfsbox-hostmounts.exports
+rm -f \"\${tmp_desired}\"
+systemctl enable --now nfs-server >/dev/null 2>&1 || systemctl enable --now nfs-kernel-server >/dev/null 2>&1 || true
+exportfs -ra
+"
+        return 0
+    fi
 
     guest_sudo_exec "
 set -Eeuo pipefail
@@ -130,7 +192,7 @@ get_host_client_ip() {
     if [[ "${host_os}" == "Darwin" ]]; then
         guest_exec "ip route | awk '/default/ {print \$3; exit}'"
     else
-        printf '%s\n' "${VM_GW:-172.16.0.1}"
+        printf '%s\n' "127.0.0.1"
     fi
 }
 
@@ -169,7 +231,7 @@ wait_for_nfs() {
     if [[ "${host_os}" == "Darwin" ]]; then
         nc -G 2 -z "${guest_ip}" 2049 >/dev/null 2>&1
     else
-        nc -w 2 -z "${guest_ip}" 2049 >/dev/null 2>&1
+        nc -w 2 -z 127.0.0.1 "${VM_NFS_PORT}" >/dev/null 2>&1
     fi
 }
 
@@ -206,27 +268,34 @@ mount_pool() {
         sudo /sbin/mount_nfs -o vers=3,tcp,nolocks "${source}" "${target}"
     else
         target="/mnt/${pool}"
-        source="${guest_ip}:${remote_mount}"
+        source="127.0.0.1:/${pool}"
         if [[ "${SKIP_HOST_MOUNTS}" == "1" ]]; then
             echo "dry-run mount ${source} -> ${target}" >&2
             return
         fi
-        if ! wait_for_nfs "${guest_ip}"; then
-            echo "Guest NFS server at ${guest_ip}:2049 is not reachable from Linux host." >&2
+        if ! command -v mount.nfs >/dev/null 2>&1 && ! command -v mount.nfs4 >/dev/null 2>&1; then
+            echo "nfs-common is required for Linux host mounts." >&2
             exit 1
         fi
-        ensure_mount_target "${target}"
+        if ! wait_for_nfs "${guest_ip}"; then
+            echo "Guest NFS server at 127.0.0.1:${VM_NFS_PORT} is not reachable from the Linux host." >&2
+            exit 1
+        fi
+        sudo mkdir -p "${target}"
 
         if is_mounted_at "${target}"; then
             current_source="$(current_mount_source "${target}")"
             if [[ "${current_source}" == "${source}" ]]; then
                 return
             fi
-            sudo umount "${target}"
-            ensure_mount_target "${target}"
+            sudo umount "${target}" || true
+            sudo mkdir -p "${target}"
         fi
 
-        sudo mount -t nfs -o vers=3,tcp,nolock "${source}" "${target}"
+        sudo mount -t nfs4 \
+            -o "port=${VM_NFS_PORT},proto=tcp,vers=4" \
+            "${source}" \
+            "${target}"
     fi
 }
 
@@ -246,7 +315,11 @@ unmount_pool_if_managed() {
     fi
 
     if is_mounted_at "${target}"; then
-        sudo umount "${target}" || true
+        if [[ "${host_os}" == "Darwin" ]]; then
+            sudo umount "${target}" || true
+        else
+            sudo umount "${target}" || true
+        fi
     fi
 
     if [[ -d "${target}" ]]; then
@@ -274,7 +347,7 @@ fi
 if [[ "${host_os}" == "Darwin" ]]; then
 guest_ip="$(guest_exec "ip -4 route get ${host_client_ip} | awk '{for (i = 1; i <= NF; i++) if (\$i == \"src\") {print \$(i + 1); exit}}'" | tr -d '[:space:]')"
 else
-    guest_ip="${VM_IP:-172.16.0.2}"
+    guest_ip="127.0.0.1"
 fi
 
 if [[ -z "${guest_ip}" ]]; then
