@@ -1,0 +1,33 @@
+bin/zfsbox-guest-exec
+  14c0027ba26bb661 16,42-43
+scripts/reconcile-host-mounts.sh
+  14c0027ba26bb661 25-29,49,66,124-125,195,278,284,291-292,318,320-322,350
+scripts/linux-qemu-common.sh
+  14c0027ba26bb661 1-31,33-150,152-228,230-284,286-348
+README.md
+  14c0027ba26bb661 8,21,23,26,45-47,75,79,87-92,109,112-113,128-129,176-177,184,187,195,201
+.env.example
+  14c0027ba26bb661 3-4,6-7
+scripts/linux-qemu-zfs-exec.sh
+  14c0027ba26bb661 1-17,19,23-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "9858901f2e00dd9c1642665f1c8ad101581dec49",
+  "prompts": {
+    "14c0027ba26bb661": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d61e7-bb4b-7c01-b983-cb15ee81f3ca",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Nick Sweeting",
+      "messages": [],
+      "total_additions": 463,
+      "total_deletions": 33,
+      "accepted_lines": 429,
+      "overriden_lines": 7
+    }
+  }
+}
