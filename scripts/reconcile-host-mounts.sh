@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE_DIR="${PROJECT_DIR}/state"
+ENV_FILE="${PROJECT_DIR}/.env"
+SKIP_HOST_MOUNTS="${ZFSBOX_SKIP_HOST_MOUNTS:-0}"
+
+if [[ -f "${ENV_FILE}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "${ENV_FILE}"
+    set +a
+fi
+
+LIMA_INSTANCE_NAME="${LIMA_INSTANCE_NAME:-${INSTANCE_NAME:-zfsbox-zfs}}"
+mkdir -p "${STATE_DIR}"
+
+log() {
+    printf 'zfsbox: %s\n' "$*" >&2
+}
+
+host_os="$(uname -s)"
+
+case "${host_os}" in
+    Darwin)
+        managed_state_file="${STATE_DIR}/host-mounts.darwin.txt"
+        ;;
+    Linux)
+        managed_state_file="${STATE_DIR}/host-mounts.linux.txt"
+        ;;
+    *)
+        echo "Unsupported host OS: ${host_os}" >&2
+        exit 1
+        ;;
+esac
+
+guest_exec() {
+    local script="$1"
+
+    if [[ "${host_os}" == "Darwin" ]]; then
+        limactl --log-level=error -y shell "${LIMA_INSTANCE_NAME}" bash -lc "${script}"
+    else
+        (
+            cd "${PROJECT_DIR}"
+            docker compose up -d --build >/dev/null
+            docker compose exec -T zfsbox /opt/zfsbox/scripts/guestctl.sh exec bash -lc "${script}"
+        )
+    fi
+}
+
+guest_sudo_exec() {
+    local script="$1"
+
+    if [[ "${host_os}" == "Darwin" ]]; then
+        limactl --log-level=error -y shell "${LIMA_INSTANCE_NAME}" sudo bash -lc "${script}"
+    else
+        guest_exec "${script}"
+    fi
+}
+
+ensure_guest_exports() {
+    local host_client_q="$1"
+
+    guest_sudo_exec "
+set -Eeuo pipefail
+
+host_client=${host_client_q}
+
+if command -v apt-get >/dev/null 2>&1 && ! command -v exportfs >/dev/null 2>&1; then
+    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update >/dev/null 2>&1
+    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y nfs-kernel-server >/dev/null 2>&1
+fi
+
+mkdir -p /etc/exports.d
+tmp_file=\$(mktemp)
+
+zfs list -H -o name,mountpoint,mounted -t filesystem -d 0 | while IFS=\$'\\t' read -r name mountpoint mounted; do
+    case \"\${mountpoint}\" in
+        legacy|none|-|'')
+            continue
+            ;;
+    esac
+
+    if [[ \"\${mounted}\" != yes ]]; then
+        continue
+    fi
+
+    printf '%s %s(rw,sync,no_subtree_check,no_root_squash,insecure,crossmnt)\\n' \"\${mountpoint}\" \"\${host_client}\"
+done > \"\${tmp_file}\"
+
+mv \"\${tmp_file}\" /etc/exports.d/zfsbox-hostmounts.exports
+systemctl enable --now nfs-server >/dev/null 2>&1 || true
+exportfs -ra
+"
+}
+
+ensure_guest_permissions() {
+    local host_uid_q="$1"
+    local host_gid_q="$2"
+
+    guest_sudo_exec "
+set -Eeuo pipefail
+
+host_uid=${host_uid_q}
+host_gid=${host_gid_q}
+
+zfs list -H -o mountpoint,mounted -t filesystem | while IFS=\$'\\t' read -r mountpoint mounted; do
+    case \"\${mountpoint}\" in
+        legacy|none|-|'')
+            continue
+            ;;
+    esac
+
+    if [[ \"\${mounted}\" != yes ]]; then
+        continue
+    fi
+
+    chown \"\${host_uid}:\${host_gid}\" \"\${mountpoint}\" 2>/dev/null || true
+    chmod 0775 \"\${mountpoint}\" 2>/dev/null || true
+done
+"
+}
+
+list_root_pools() {
+    guest_sudo_exec "zfs list -H -o name,mountpoint,mounted -t filesystem -d 0"
+}
+
+get_host_client_ip() {
+    if [[ "${host_os}" == "Darwin" ]]; then
+        guest_exec "ip route | awk '/default/ {print \$3; exit}'"
+    else
+        printf '%s\n' "${VM_GW:-172.16.0.1}"
+    fi
+}
+
+ensure_mount_target() {
+    local target="$1"
+
+    if [[ "${host_os}" == "Darwin" ]]; then
+        sudo mkdir -p "${target}"
+    else
+        sudo mkdir -p "${target}"
+    fi
+}
+
+is_mounted_at() {
+    local target="$1"
+    mount | grep -F " on ${target} " >/dev/null 2>&1
+}
+
+current_mount_source() {
+    local target="$1"
+    mount | awk -v target="${target}" '$2 == "on" && $3 == target { print $1; exit }'
+}
+
+ensure_host_mount_privileges() {
+    if [[ "${SKIP_HOST_MOUNTS}" == "1" ]]; then
+        return
+    fi
+
+    log "authorizing host mounts under ${host_os}"
+    sudo -v
+}
+
+wait_for_nfs() {
+    local guest_ip="$1"
+
+    if [[ "${host_os}" == "Darwin" ]]; then
+        nc -G 2 -z "${guest_ip}" 2049 >/dev/null 2>&1
+    else
+        nc -w 2 -z "${guest_ip}" 2049 >/dev/null 2>&1
+    fi
+}
+
+mount_pool() {
+    local guest_ip="$1"
+    local remote_mount="$2"
+    local pool="$3"
+    local target
+    local source
+    local current_source
+
+    if [[ "${host_os}" == "Darwin" ]]; then
+        target="/Volumes/${pool}"
+        source="${guest_ip}:${remote_mount}"
+        if [[ "${SKIP_HOST_MOUNTS}" == "1" ]]; then
+            echo "dry-run mount ${source} -> ${target}" >&2
+            return
+        fi
+        if ! wait_for_nfs "${guest_ip}"; then
+            echo "Guest NFS server at ${guest_ip}:2049 is not reachable from macOS." >&2
+            exit 1
+        fi
+        ensure_mount_target "${target}"
+
+        if is_mounted_at "${target}"; then
+            current_source="$(current_mount_source "${target}")"
+            if [[ "${current_source}" == "${source}" ]]; then
+                return
+            fi
+            sudo umount "${target}"
+            ensure_mount_target "${target}"
+        fi
+
+        sudo /sbin/mount_nfs -o vers=3,tcp,nolocks "${source}" "${target}"
+    else
+        target="/mnt/${pool}"
+        source="${guest_ip}:${remote_mount}"
+        if [[ "${SKIP_HOST_MOUNTS}" == "1" ]]; then
+            echo "dry-run mount ${source} -> ${target}" >&2
+            return
+        fi
+        if ! wait_for_nfs "${guest_ip}"; then
+            echo "Guest NFS server at ${guest_ip}:2049 is not reachable from Linux host." >&2
+            exit 1
+        fi
+        ensure_mount_target "${target}"
+
+        if is_mounted_at "${target}"; then
+            current_source="$(current_mount_source "${target}")"
+            if [[ "${current_source}" == "${source}" ]]; then
+                return
+            fi
+            sudo umount "${target}"
+            ensure_mount_target "${target}"
+        fi
+
+        sudo mount -t nfs -o vers=3,tcp,nolock "${source}" "${target}"
+    fi
+}
+
+unmount_pool_if_managed() {
+    local pool="$1"
+    local target
+
+    if [[ "${host_os}" == "Darwin" ]]; then
+        target="/Volumes/${pool}"
+    else
+        target="/mnt/${pool}"
+    fi
+
+    if [[ "${SKIP_HOST_MOUNTS}" == "1" ]]; then
+        echo "dry-run unmount ${target}" >&2
+        return
+    fi
+
+    if is_mounted_at "${target}"; then
+        sudo umount "${target}" || true
+    fi
+
+    if [[ -d "${target}" ]]; then
+        sudo rmdir "${target}" 2>/dev/null || true
+    fi
+}
+
+previous_pools_file="$(mktemp)"
+desired_pools_file="$(mktemp)"
+trap 'rm -f "${previous_pools_file}" "${desired_pools_file}"' EXIT
+
+if [[ -f "${managed_state_file}" ]]; then
+    cp "${managed_state_file}" "${previous_pools_file}"
+else
+    : > "${previous_pools_file}"
+fi
+
+host_client_ip="$(get_host_client_ip | tr -d '[:space:]')"
+
+if [[ -z "${host_client_ip}" ]]; then
+    echo "Failed to determine guest or host IP for mount reconciliation." >&2
+    exit 1
+fi
+
+if [[ "${host_os}" == "Darwin" ]]; then
+guest_ip="$(guest_exec "ip -4 route get ${host_client_ip} | awk '{for (i = 1; i <= NF; i++) if (\$i == \"src\") {print \$(i + 1); exit}}'" | tr -d '[:space:]')"
+else
+    guest_ip="${VM_IP:-172.16.0.2}"
+fi
+
+if [[ -z "${guest_ip}" ]]; then
+    echo "Failed to determine guest IP for host mount reconciliation." >&2
+    exit 1
+fi
+
+printf -v host_client_q '%q' "${host_client_ip}"
+printf -v host_uid_q '%q' "$(id -u)"
+printf -v host_gid_q '%q' "$(id -g)"
+ensure_guest_exports "${host_client_q}"
+ensure_guest_permissions "${host_uid_q}" "${host_gid_q}"
+ensure_host_mount_privileges
+
+pool_lines="$(list_root_pools || true)"
+: > "${desired_pools_file}"
+
+while IFS=$'\t' read -r pool mountpoint mounted; do
+    [[ -n "${pool:-}" ]] || continue
+
+    case "${mountpoint}" in
+        legacy|none|-|'')
+            continue
+            ;;
+    esac
+
+    if [[ "${mounted}" != "yes" ]]; then
+        continue
+    fi
+
+    printf '%s\n' "${pool}" >> "${desired_pools_file}"
+    mount_pool "${guest_ip}" "${mountpoint}" "${pool}"
+done <<< "${pool_lines}"
+
+while IFS= read -r pool; do
+    [[ -n "${pool}" ]] || continue
+    if ! grep -Fxq "${pool}" "${desired_pools_file}"; then
+        unmount_pool_if_managed "${pool}"
+    fi
+done < "${previous_pools_file}"
+
+sort -u "${desired_pools_file}" > "${managed_state_file}"

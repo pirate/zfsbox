@@ -1,0 +1,30 @@
+services:
+  zfsbox:
+    build:
+      context: .
+    privileged: true
+    network_mode: host
+    devices:
+      - /dev/kvm:/dev/kvm
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      DATA_DISK_SIZE: ${DATA_DISK_SIZE:-20G}
+      FIRECRACKER_VERSION: ${FIRECRACKER_VERSION:-v1.15.0}
+      GUEST_RELEASE: ${GUEST_RELEASE:-noble}
+      HOST_SHARE_DIR: ${HOST_SHARE_DIR:-/host-share}
+      POOL_NAME: ${POOL_NAME:-tank}
+      ROOTFS_SIZE: ${ROOTFS_SIZE:-8G}
+      SHARE_EXPORT: ${SHARE_EXPORT:-/tank/share}
+      STATE_DIR: ${STATE_DIR:-/state}
+      TAP_DEV: ${TAP_DEV:-tap0}
+      TAP_HOST_CIDR: ${TAP_HOST_CIDR:-172.16.0.1/30}
+      UBUNTU_MIRROR: ${UBUNTU_MIRROR:-}
+      VM_GW: ${VM_GW:-172.16.0.1}
+      VM_IP: ${VM_IP:-172.16.0.2}
+      VM_MEMORY_MB: ${VM_MEMORY_MB:-2048}
+      VM_PREFIX: ${VM_PREFIX:-30}
+      VM_SUBNET_CIDR: ${VM_SUBNET_CIDR:-172.16.0.0/30}
+      VM_VCPUS: ${VM_VCPUS:-2}
+    volumes:
+      - ./state:${STATE_DIR:-/state}
+      - ./host-share:${HOST_SHARE_DIR:-/host-share}

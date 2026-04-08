@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${BIN_DIR}/.." && pwd)"
+
+needs_sync=0
+
+case "${1:-}" in
+    create|destroy|rename|clone|receive|recv|set|inherit|mount|unmount|umount|load-key|unload-key)
+        needs_sync=1
+        ;;
+esac
+
+set +e
+"${BIN_DIR}/zfsbox-guest-exec" zfs "$@"
+status=$?
+set -e
+
+if [[ "${status}" -eq 0 && "${needs_sync}" -eq 1 ]]; then
+    "${PROJECT_DIR}/scripts/reconcile-host-mounts.sh"
+fi
+
+exit "${status}"

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${BIN_DIR}/.." && pwd)"
+ENV_FILE="${PROJECT_DIR}/.env"
+
+if [[ -f "${ENV_FILE}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "${ENV_FILE}"
+    set +a
+fi
+
+LIMA_INSTANCE_NAME="${LIMA_INSTANCE_NAME:-${INSTANCE_NAME:-zfsbox}}"
+
+if [[ $# -eq 0 ]]; then
+    echo "Usage: $(basename "$0") <command> [args...]" >&2
+    exit 1
+fi
+
+run_local_compose() {
+    (
+        cd "${PROJECT_DIR}"
+        docker compose "$@"
+    )
+}
+
+run_compose() {
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        "${PROJECT_DIR}/scripts/macos-lima-zfs-exec.sh" "$@"
+    else
+        run_local_compose "$@"
+    fi
+}
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    exec "${PROJECT_DIR}/scripts/macos-lima-zfs-exec.sh" "$@"
+fi
+
+run_compose up -d --build >/dev/null
+
+run_compose exec -T zfsbox /opt/zfsbox/scripts/guestctl.sh exec "$@"
