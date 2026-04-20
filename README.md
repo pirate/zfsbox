@@ -1,4 +1,4 @@
-# zfsbox: Run virtualized ZFS from userspace on macOS/Linux (without needing to install it)!
+# 🗄️ `zfsbox`<br/> Run virtualized ZFS from userspace on macOS/Linux<br/><small>(without needing to install ZFS kernel modules!)</small>
 
 > 🐚 Run ZFS in a Linux VM using any `/dev/diskN` or file on the host machine as the backing store. Exposes pools & datasets back to the host as normal volumes under `/mnt` or `/Volumes` (via NFSv4).
 
