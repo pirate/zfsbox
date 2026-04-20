@@ -59,6 +59,15 @@ source ./zfsbox.aliases.sh
 
 This overrides `zfs` and `zpool` in the current shell only.
 
+Optional macOS Lima overrides in `.env`:
+
+```bash
+LIMA_VM_RECREATE=true
+LIMA_VM_MOUNTS=[{"location":"/Users/you","writable":true},{"location":"/Volumes","writable":true}]
+```
+
+Both are optional. `LIMA_VM_RECREATE=true` forces the next run to rebuild the Lima instance from scratch. `LIMA_VM_MOUNTS` overrides the default `${HOME}` and `/Volumes` mounts with a JSON array of Lima mount objects. For `zfsbox`, each mount must resolve to the same guest path as its host `location`; if `mountPoint` is omitted, `zfsbox` fills it in automatically.
+
 ### 2. Create a backing file on the host
 
 ```bash
@@ -182,7 +191,7 @@ zfs list
 ## ⚠️ Notes
 
 - macOS uses **Lima directly** with `vz`, `virtiofs`, and `vzNAT`.
-- Host-backed file vdevs must live under paths mounted into the guest. The current macOS wrapper exposes `${HOME}` and `/Volumes`.
+- Host-backed file vdevs must live under paths mounted into the guest. By default the macOS wrapper exposes `${HOME}` and `/Volumes`, and `LIMA_VM_MOUNTS` can override that mount set.
 - The current Linux wrapper shares host `/` into the guest once and rewrites absolute host paths to `/host/...` automatically.
 - Host-visible pool mounts are implemented with **guest-side NFS** on macOS and **guest-side NFSv4 over localhost port forwarding** on Linux.
 - macOS host mountpoints under `/Volumes/<pool>` may require re-auth with Touch ID when reconciling mounts.
