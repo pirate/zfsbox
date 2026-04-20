@@ -1,11 +1,11 @@
-# zfsbox
+# zfsbox: Run virtualized ZFS from userspace on macOS/Linux (without needing to install it)!
 
-> 🐚 Run ZFS in a Linux guest, keep the backing storage on the host, and surface pools back to the host as normal volumes.
+> 🐚 Run ZFS in a Linux VM using any `/dev/diskN` or file on the host machine as the backing store. Exposes pools & datasets back to the host as normal volumes under `/mnt` or `/Volumes` (via NFSv4).
 
 `zfsbox` is a host-side wrapper around a Linux ZFS environment.
 
-- On **macOS**, it currently runs ZFS inside a **Lima `vz` guest** and mounts pool roots back onto the host at `/Volumes/<pool>`.
-- On **Linux**, it now prefers a **rootless QEMU guest** with host path passthrough and automatic host mounts under `/mnt/<pool>`.
+- On **macOS**, it runs ZFS inside a **Lima `vz` guest** (using native macOS hypervisor framework) and mounts pool roots back onto the host at `/Volumes/<pool>`.
+- On **Linux**, it runs a **rootless QEMU guest** with host path passthrough and automatic host mounts under `/mnt/<pool>`.
 
 The current sweet spot is:
 
