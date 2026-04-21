@@ -6,7 +6,6 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${PROJECT_DIR}/.env"
 HOME_MOUNT="${HOME}"
 VOLUMES_MOUNT="/Volumes"
-DEV_MOUNT="/dev"
 STATE_ROOT_DIR="${ZFSBOX_STATE_DIR:-${PROJECT_DIR}/state}"
 STATE_DIR="${STATE_ROOT_DIR}/macos-lima"
 LIMA_ARGS=(--log-level=error -y)
@@ -72,13 +71,11 @@ json_escape() {
 }
 
 default_lima_vm_mounts_json() {
-    printf '[{"location":"%s","mountPoint":"%s","writable":true},{"location":"%s","mountPoint":"%s","writable":true},{"location":"%s","mountPoint":"%s","writable":true}]' \
+    printf '[{"location":"%s","mountPoint":"%s","writable":true},{"location":"%s","mountPoint":"%s","writable":true}]' \
         "$(json_escape "${HOME_MOUNT}")" \
         "$(json_escape "${HOME_MOUNT}")" \
         "$(json_escape "${VOLUMES_MOUNT}")" \
-        "$(json_escape "${VOLUMES_MOUNT}")" \
-        "$(json_escape "${DEV_MOUNT}")" \
-        "$(json_escape "${DEV_MOUNT}")"
+        "$(json_escape "${VOLUMES_MOUNT}")"
 }
 
 load_mount_configuration() {
@@ -90,7 +87,7 @@ load_mount_configuration() {
         raw_mounts="$(default_lima_vm_mounts_json)"
     fi
 
-    parsed="$(LIMA_VM_MOUNTS_RAW="${raw_mounts}" osascript -l JavaScript <<'EOF'
+    parsed="$(LIMA_VM_MOUNTS_RAW="${raw_mounts}" osascript -l JavaScript 2>&1 <<'EOF'
 ObjC.import('Foundation');
 ObjC.import('stdlib');
 
