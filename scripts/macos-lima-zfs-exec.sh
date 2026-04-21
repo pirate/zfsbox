@@ -1,16 +1,43 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-INSTANCE_NAME="${LIMA_INSTANCE_NAME:-zfsbox-zfs}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${PROJECT_DIR}/.env"
-HOME_MOUNT="${HOME}"
-VOLUMES_MOUNT="/Volumes"
 STATE_ROOT_DIR="${ZFSBOX_STATE_DIR:-${PROJECT_DIR}/state}"
-STATE_DIR="${STATE_ROOT_DIR}/macos-lima"
-LIMA_ARGS=(--log-level=error -y)
-LIMA_CONFIG_FILE="${HOME}/.lima/${INSTANCE_NAME}/lima.yaml"
-LIMA_MARKER_FILE="${STATE_DIR}/${INSTANCE_NAME}.marker"
+STATE_DIR="${STATE_ROOT_DIR}/macos-vz"
+ASSETS_DIR="${STATE_DIR}/assets"
+CLOUD_DIR="${STATE_DIR}/cloud"
+HELPER_SOURCE="${PROJECT_DIR}/scripts/macos-vz-helper.swift"
+HELPER_ENTITLEMENTS="${PROJECT_DIR}/scripts/macos-vz-helper.entitlements"
+HELPER_BIN="${STATE_DIR}/zfsbox-vz-helper"
+BASE_QCOW2="${ASSETS_DIR}/ubuntu-cloudimg.qcow2"
+BASE_RAW="${ASSETS_DIR}/ubuntu-cloudimg.raw"
+ROOTFS_RAW="${ASSETS_DIR}/rootfs.raw"
+ROOTFS_IMAGE="${ASSETS_DIR}/rootfs.dmg"
+SEED_IMAGE="${ASSETS_DIR}/seed.dmg"
+KERNEL_IMAGE="${ASSETS_DIR}/vmlinuz"
+KERNEL_UNCOMPRESSED_IMAGE="${ASSETS_DIR}/Image"
+INITRD_IMAGE="${ASSETS_DIR}/initrd"
+HOST_KEY="${STATE_DIR}/id_ed25519"
+HOST_KEY_PUB="${HOST_KEY}.pub"
+KNOWN_HOSTS="${STATE_DIR}/known_hosts"
+PID_FILE="${STATE_DIR}/vz.pid"
+HELPER_LOG="${STATE_DIR}/helper.log"
+SERIAL_LOG="${STATE_DIR}/serial.log"
+GUEST_IP_FILE="${STATE_DIR}/guest-ip"
+ATTACHMENTS_FILE="${STATE_DIR}/attachments.txt"
+RUN_AS_ROOT_FILE="${STATE_DIR}/run-as-root"
+VM_TMUX_SESSION="zfsbox-vz"
+HOST_SHARE="/"
+VM_MEMORY_MB=2048
+VM_VCPUS=2
+GUEST_MAC_ADDRESS="${GUEST_MAC_ADDRESS:-02:00:00:00:00:01}"
+VM_SSH_TIMEOUT_SECONDS="${VM_SSH_TIMEOUT_SECONDS:-10}"
+VM_WAIT_TIMEOUT_SECONDS="${VM_WAIT_TIMEOUT_SECONDS:-600}"
+GUEST_RELEASE="${GUEST_RELEASE:-noble}"
+GUEST_IMAGE_URL="${GUEST_IMAGE_URL:-https://cloud-images.ubuntu.com/${GUEST_RELEASE}/current/${GUEST_RELEASE}-server-cloudimg-arm64.img}"
+KERNEL_URL="${KERNEL_URL:-https://cloud-images.ubuntu.com/${GUEST_RELEASE}/current/unpacked/${GUEST_RELEASE}-server-cloudimg-arm64-vmlinuz-generic}"
+INITRD_URL="${INITRD_URL:-https://cloud-images.ubuntu.com/${GUEST_RELEASE}/current/unpacked/${GUEST_RELEASE}-server-cloudimg-arm64-initrd-generic}"
 
 if [[ -f "${ENV_FILE}" ]]; then
     set -a
@@ -19,296 +46,483 @@ if [[ -f "${ENV_FILE}" ]]; then
     set +a
 fi
 
-VM_MEMORY_MB="${VM_MEMORY_MB:-2048}"
-VM_VCPUS="${VM_VCPUS:-2}"
-LIMA_VM_RECREATE="${LIMA_VM_RECREATE:-false}"
-LIMA_VM_MOUNTS="${LIMA_VM_MOUNTS:-}"
-
-mkdir -p "${STATE_DIR}"
-
-require_positive_int() {
-    local name="$1"
-    local value="$2"
-
-    if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
-        echo "${name} must be a positive integer; got: ${value}" >&2
-        exit 1
-    fi
-}
-
-require_positive_int "VM_MEMORY_MB" "${VM_MEMORY_MB}"
-require_positive_int "VM_VCPUS" "${VM_VCPUS}"
-
-require_bool() {
-    local name="$1"
-    local value="$2"
-
-    case "${value}" in
-        true|false)
-            ;;
-        *)
-            echo "${name} must be 'true' or 'false'; got: ${value}" >&2
-            exit 1
-            ;;
-    esac
-}
-
-require_bool "LIMA_VM_RECREATE" "${LIMA_VM_RECREATE}"
-
-LIMA_MEMORY_GIB="$(awk -v mb="${VM_MEMORY_MB}" 'BEGIN { printf "%.6g", mb / 1024 }')"
-LIMA_MEMORY_REGEX="${LIMA_MEMORY_GIB//./\\.}"
-
 log() {
     printf 'zfsbox: %s\n' "$*" >&2
 }
 
-json_escape() {
-    local value="$1"
-
-    value="${value//\\/\\\\}"
-    value="${value//\"/\\\"}"
-    printf '%s' "${value}"
+require_cmd() {
+    local name="$1"
+    command -v "${name}" >/dev/null 2>&1 || {
+        echo "Required command not found: ${name}" >&2
+        exit 1
+    }
 }
 
-default_lima_vm_mounts_json() {
-    printf '[{"location":"%s","mountPoint":"%s","writable":true},{"location":"%s","mountPoint":"%s","writable":true}]' \
-        "$(json_escape "${HOME_MOUNT}")" \
-        "$(json_escape "${HOME_MOUNT}")" \
-        "$(json_escape "${VOLUMES_MOUNT}")" \
-        "$(json_escape "${VOLUMES_MOUNT}")"
+host_root_run() {
+    if [[ "${EUID}" -eq 0 ]]; then
+        "$@"
+        return
+    fi
+    sudo "$@"
 }
 
-load_mount_configuration() {
-    local raw_mounts parsed line line_no normalized
+init_dirs() {
+    mkdir -p "${STATE_DIR}" "${ASSETS_DIR}" "${CLOUD_DIR}"
+}
 
-    if [[ -n "${LIMA_VM_MOUNTS}" ]]; then
-        raw_mounts="${LIMA_VM_MOUNTS}"
-    else
-        raw_mounts="$(default_lima_vm_mounts_json)"
+ensure_dependencies() {
+    require_cmd curl
+    require_cmd qemu-img
+    require_cmd ssh
+    require_cmd ssh-keygen
+    require_cmd hdiutil
+    require_cmd tmux
+    require_cmd swiftc
+}
+
+ensure_host_key() {
+    if [[ -f "${HOST_KEY}" && -f "${HOST_KEY_PUB}" ]]; then
+        return
+    fi
+    ssh-keygen -q -t ed25519 -N "" -f "${HOST_KEY}" >/dev/null
+}
+
+compile_helper() {
+    if [[ ! -x "${HELPER_BIN}" || "${HELPER_SOURCE}" -nt "${HELPER_BIN}" || "${HELPER_ENTITLEMENTS}" -nt "${HELPER_BIN}" ]]; then
+        log "compiling native macOS VM helper"
+        swiftc -framework Virtualization "${HELPER_SOURCE}" -o "${HELPER_BIN}"
+        codesign -s - --force --entitlements "${HELPER_ENTITLEMENTS}" "${HELPER_BIN}" >/dev/null
+    fi
+}
+
+ensure_base_image() {
+    if [[ ! -f "${BASE_QCOW2}" ]]; then
+        log "downloading Ubuntu cloud image (${GUEST_RELEASE})"
+        curl -fsSL "${GUEST_IMAGE_URL}" -o "${BASE_QCOW2}"
     fi
 
-    parsed="$(LIMA_VM_MOUNTS_RAW="${raw_mounts}" osascript -l JavaScript 2>&1 <<'EOF'
-ObjC.import('Foundation');
-ObjC.import('stdlib');
+    if [[ ! -f "${BASE_RAW}" || "${BASE_QCOW2}" -nt "${BASE_RAW}" ]]; then
+        log "converting Ubuntu cloud image to raw format"
+        qemu-img convert -f qcow2 -O raw "${BASE_QCOW2}" "${BASE_RAW}"
+    fi
 
-const env = $.NSProcessInfo.processInfo.environment;
-const raw = ObjC.unwrap(env.objectForKey('LIMA_VM_MOUNTS_RAW'));
+    if [[ ! -f "${ROOTFS_RAW}" ]]; then
+        log "seeding writable VM rootfs"
+        cp "${BASE_RAW}" "${ROOTFS_RAW}"
+    fi
 
-try {
-  const mounts = JSON.parse(raw);
-  if (!Array.isArray(mounts)) {
-    throw new Error("LIMA_VM_MOUNTS must be a JSON array of Lima mount objects");
-  }
+    if [[ ! -f "${ROOTFS_IMAGE}" || "${ROOTFS_RAW}" -nt "${ROOTFS_IMAGE}" ]]; then
+        log "rewrapping VM rootfs into VZ-compatible disk image"
+        rm -f "${ROOTFS_IMAGE}" "${ROOTFS_IMAGE%.dmg}"
+        hdiutil convert \
+            "${ROOTFS_RAW}" \
+            -srcimagekey diskimage-class=CRawDiskImage \
+            -format UDRW \
+            -o "${ROOTFS_IMAGE%.dmg}" >/dev/null
+    fi
 
-  const normalized = [];
-  for (let i = 0; i < mounts.length; i += 1) {
-    const mount = mounts[i];
-    if (mount === null || Array.isArray(mount) || typeof mount !== "object") {
-      throw new Error(`LIMA_VM_MOUNTS[${i}] must be an object`);
-    }
-    if (typeof mount.location !== "string" || !mount.location.startsWith("/")) {
-      throw new Error(`LIMA_VM_MOUNTS[${i}].location must be an absolute host path`);
-    }
-    const nextMount = { ...mount };
-    if (!Object.prototype.hasOwnProperty.call(nextMount, "mountPoint")) {
-      nextMount.mountPoint = nextMount.location;
-    } else {
-      if (typeof nextMount.mountPoint !== "string" || !nextMount.mountPoint.startsWith("/")) {
-        throw new Error(`LIMA_VM_MOUNTS[${i}].mountPoint must be an absolute guest path`);
-      }
-      if (nextMount.mountPoint !== nextMount.location) {
-        throw new Error(`LIMA_VM_MOUNTS[${i}].mountPoint must match location so host paths stay valid inside zfsbox`);
-      }
-    }
+    if [[ ! -f "${KERNEL_IMAGE}" ]]; then
+        log "downloading Ubuntu kernel"
+        curl -fsSL "${KERNEL_URL}" -o "${KERNEL_IMAGE}"
+    fi
 
-    normalized.push(nextMount);
-  }
+    if [[ ! -f "${KERNEL_UNCOMPRESSED_IMAGE}" || "${KERNEL_IMAGE}" -nt "${KERNEL_UNCOMPRESSED_IMAGE}" ]]; then
+        log "decompressing Ubuntu kernel for Virtualization.framework"
+        gzip -dc "${KERNEL_IMAGE}" > "${KERNEL_UNCOMPRESSED_IMAGE}.tmp"
+        mv "${KERNEL_UNCOMPRESSED_IMAGE}.tmp" "${KERNEL_UNCOMPRESSED_IMAGE}"
+    fi
 
-  console.log(JSON.stringify(normalized));
-  for (const mount of normalized) {
-    console.log(mount.location);
-  }
-} catch (error) {
-  console.error(String(error.message || error));
-  $.exit(1);
+    if [[ ! -f "${INITRD_IMAGE}" ]]; then
+        log "downloading Ubuntu initrd"
+        curl -fsSL "${INITRD_URL}" -o "${INITRD_IMAGE}"
+    fi
 }
+
+render_cloud_init() {
+    local pubkey="$1"
+
+    cat > "${CLOUD_DIR}/meta-data" <<EOF
+instance-id: zfsbox-macos-vz
+local-hostname: zfsbox
 EOF
-)" || exit 1
 
-    LIMA_ALLOWED_PATHS=()
-    line_no=0
-    while IFS= read -r line; do
-        if [[ "${line_no}" -eq 0 ]]; then
-            LIMA_VM_MOUNTS_JSON="${line}"
-        elif [[ -n "${line}" ]]; then
-            normalized="${line%/}"
-            if [[ -z "${normalized}" ]]; then
-                normalized="/"
-            fi
-            LIMA_ALLOWED_PATHS+=("${normalized}")
+    cat > "${CLOUD_DIR}/user-data" <<EOF
+#cloud-config
+package_update: true
+package_upgrade: false
+ssh_pwauth: false
+disable_root: false
+packages:
+  - openssh-server
+  - nfs-kernel-server
+  - zfsutils-linux
+write_files:
+  - path: /root/.ssh/authorized_keys
+    permissions: "0600"
+    owner: root:root
+    content: |
+      ${pubkey}
+  - path: /etc/ssh/sshd_config.d/zfsbox.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      PermitRootLogin yes
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      ChallengeResponseAuthentication no
+  - path: /etc/netplan/90-zfsbox.yaml
+    permissions: "0644"
+    owner: root:root
+    content: |
+      network:
+        version: 2
+        ethernets:
+          enp0s1:
+            match:
+              macaddress: ${GUEST_MAC_ADDRESS}
+            set-name: enp0s1
+            dhcp4: true
+  - path: /usr/local/sbin/zfsbox-report-ip.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+      for _ in \$(seq 1 60); do
+        guest_ip=\$(ip -4 -o addr show scope global | awk '{split(\$4, cidr, "/"); print cidr[1]; exit}')
+        if [[ -n "\${guest_ip}" ]]; then
+          printf 'ZFSBOX_GUEST_IP=%s\n' "\${guest_ip}" > /dev/console
+          exit 0
         fi
-        line_no=$((line_no + 1))
-    done <<< "${parsed}"
+        sleep 1
+      done
+      echo 'zfsbox: no guest IPv4 address became available' > /dev/console
+      exit 1
+  - path: /etc/systemd/system/zfsbox-report-ip.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Write zfsbox guest IP to the serial console
+      After=network-online.target ssh.socket
+      Wants=network-online.target ssh.socket
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/zfsbox-report-ip.sh
+
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - systemctl daemon-reload
+  - systemctl enable --now zfsbox-report-ip.service
+  - modprobe zfs || true
+EOF
 }
 
-if ! command -v limactl >/dev/null 2>&1; then
-    echo "limactl is required on macOS. Install Lima first: brew install lima" >&2
-    exit 1
-fi
+build_seed_image() {
+    local pubkey
+    local mountpoint
+    local device
+    pubkey="$(cat "${HOST_KEY_PUB}")"
+    render_cloud_init "${pubkey}"
 
-if [[ $# -eq 0 ]]; then
-    echo "Usage: $(basename "$0") <command> [args...]" >&2
-    exit 1
-fi
+    rm -f "${SEED_IMAGE}"
+    hdiutil create -size 16m -fs MS-DOS -volname cidata "${SEED_IMAGE}" >/dev/null
 
-validate_visible_paths() {
-    local arg visible_root
+    mountpoint="$(mktemp -d /tmp/zfsbox-seed.XXXXXX)"
+    device="$(hdiutil attach -nobrowse -mountpoint "${mountpoint}" "${SEED_IMAGE}" | awk 'NR==1 {print $1}')"
+    cp "${CLOUD_DIR}/meta-data" "${mountpoint}/meta-data"
+    cp "${CLOUD_DIR}/user-data" "${mountpoint}/user-data"
+    sync
+    hdiutil detach "${device}" >/dev/null
+    rmdir "${mountpoint}"
+}
+
+attachment_needs_root() {
+    local path="$1"
+    [[ "${path}" == /dev/* ]]
+}
+
+compute_attachment_set() {
+    local arg
+    local -a attachments=()
 
     for arg in "$@"; do
         case "${arg}" in
-            /*)
-                visible_root=""
-                for visible_root in "${LIMA_ALLOWED_PATHS[@]}"; do
-                    if [[ "${visible_root}" == "/" || "${arg}" == "${visible_root}" || "${arg}" == "${visible_root}/"* ]]; then
-                        break
-                    fi
-                    visible_root=""
-                done
-
-                if [[ -z "${visible_root}" ]]; then
-                    echo "Absolute path ${arg} is not visible inside the Lima guest. Update LIMA_VM_MOUNTS to include its host path." >&2
+            /dev/*)
+                [[ -e "${arg}" ]] || {
+                    echo "Block device does not exist: ${arg}" >&2
                     exit 1
-                fi
+                }
+                attachments+=("${arg}")
                 ;;
         esac
     done
+
+    printf '%s\n' "${attachments[@]}"
 }
 
-lima_expected_marker() {
-    cat <<EOF
-LIMA_VM_MOUNTS_JSON=${LIMA_VM_MOUNTS_JSON}
-EOF
+translated_device_path() {
+    local index="$1"
+    local letter
+    printf -v letter "\\$(printf '%03o' "$((99 + index))")"
+    printf '/dev/vd%s\n' "${letter}"
 }
 
-instance_needs_resource_update() {
-    [[ -f "${LIMA_CONFIG_FILE}" ]] || return 1
+translate_args() {
+    local index=0
+    local arg
+    local -a translated=()
 
-    if ! grep -Eq "^[[:space:]]*cpus:[[:space:]]*${VM_VCPUS}[[:space:]]*$" "${LIMA_CONFIG_FILE}"; then
-        return 0
+    for arg in "$@"; do
+        case "${arg}" in
+            /dev/*)
+                translated+=("$(translated_device_path "${index}")")
+                index=$((index + 1))
+                ;;
+            /*)
+                translated+=("/host${arg}")
+                ;;
+            *)
+                translated+=("${arg}")
+                ;;
+        esac
+    done
+
+    printf '%s\n' "${translated[@]}"
+}
+
+vm_running() {
+    local run_as_root="0"
+
+    if [[ -f "${RUN_AS_ROOT_FILE}" ]]; then
+        run_as_root="$(cat "${RUN_AS_ROOT_FILE}" 2>/dev/null || printf '0')"
     fi
 
-    if ! grep -Eq "^[[:space:]]*memory:[[:space:]]*\"?${LIMA_MEMORY_REGEX}(GiB)?\"?[[:space:]]*$" "${LIMA_CONFIG_FILE}"; then
-        return 0
+    if [[ "${run_as_root}" == "1" ]]; then
+        host_root_run tmux has-session -t "${VM_TMUX_SESSION}" >/dev/null 2>&1
+    else
+        tmux has-session -t "${VM_TMUX_SESSION}" >/dev/null 2>&1
+    fi
+}
+
+stop_vm() {
+    local run_as_root="0"
+
+    if [[ -f "${RUN_AS_ROOT_FILE}" ]]; then
+        run_as_root="$(cat "${RUN_AS_ROOT_FILE}" 2>/dev/null || printf '0')"
     fi
 
+    if [[ "${run_as_root}" == "1" ]]; then
+        host_root_run tmux kill-session -t "${VM_TMUX_SESSION}" >/dev/null 2>&1 || true
+    else
+        tmux kill-session -t "${VM_TMUX_SESSION}" >/dev/null 2>&1 || true
+    fi
+
+    for _ in $(seq 1 20); do
+        if ! vm_running; then
+            rm -f "${PID_FILE}" "${RUN_AS_ROOT_FILE}"
+            return 0
+        fi
+        sleep 1
+    done
+
+    rm -f "${PID_FILE}" "${RUN_AS_ROOT_FILE}"
+}
+
+attachments_changed() {
+    local new_file
+    new_file="$(mktemp)"
+    printf '%s\n' "$@" > "${new_file}"
+    if ! cmp -s "${new_file}" "${ATTACHMENTS_FILE}" 2>/dev/null; then
+        mv "${new_file}" "${ATTACHMENTS_FILE}"
+        return 0
+    fi
+    rm -f "${new_file}"
     return 1
 }
 
-instance_needs_mount_update() {
-    local expected current
+start_vm() {
+    local use_root="$1"
+    shift
+    local -a attachments=("$@")
+    local attempt
+    local inner_cmd
+    local helper_log_q
+    local launcher_cmd
+    local -a cmd=(
+        "${HELPER_BIN}"
+        --kernel "${KERNEL_UNCOMPRESSED_IMAGE}"
+        --initrd "${INITRD_IMAGE}"
+        --rootfs "${ROOTFS_IMAGE}"
+        --seed "${SEED_IMAGE}"
+        --state-share "${STATE_DIR}"
+        --host-share "${HOST_SHARE}"
+        --serial-log "${SERIAL_LOG}"
+    )
 
-    expected="$(lima_expected_marker)"
-    current="$(cat "${LIMA_MARKER_FILE}" 2>/dev/null || true)"
-    [[ "${current}" != "${expected}" ]]
+    rm -f "${GUEST_IP_FILE}" "${HELPER_LOG}" "${SERIAL_LOG}"
+
+    for attachment in "${attachments[@]}"; do
+        cmd+=(--attach "${attachment}")
+    done
+
+    printf -v helper_log_q '%q' "${HELPER_LOG}"
+    printf -v inner_cmd 'cd %q && exec ' "${PROJECT_DIR}"
+    printf -v inner_cmd '%s%q ' "${inner_cmd}" "${cmd[0]}"
+    for (( attempt = 1; attempt < ${#cmd[@]}; attempt++ )); do
+        printf -v inner_cmd '%s%q ' "${inner_cmd}" "${cmd[attempt]}"
+    done
+    inner_cmd="${inner_cmd} >>${helper_log_q} 2>&1"
+    printf -v launcher_cmd 'tmux new-session -d -s %q zsh -lc %q' "${VM_TMUX_SESSION}" "${inner_cmd}"
+
+    for attempt in 1 2 3 4 5; do
+        rm -f "${PID_FILE}" "${RUN_AS_ROOT_FILE}"
+
+        if [[ "${use_root}" == "1" ]]; then
+            host_root_run zsh -lc "${launcher_cmd}"
+        else
+            zsh -lc "${launcher_cmd}"
+        fi
+        printf '%s\n' "${use_root}" > "${RUN_AS_ROOT_FILE}"
+
+        sleep 4
+        if vm_running; then
+            return 0
+        fi
+
+        if grep -Fq 'storage device attachment is invalid' "${HELPER_LOG}" 2>/dev/null; then
+            rm -f "${HELPER_LOG}" "${SERIAL_LOG}" "${PID_FILE}" "${RUN_AS_ROOT_FILE}"
+            sleep 1
+            continue
+        fi
+
+        break
+    done
+
+    echo "Failed to start native macOS VM. See ${HELPER_LOG}." >&2
+    exit 1
 }
 
-write_lima_marker() {
-    printf '%s\n' "$(lima_expected_marker)" > "${LIMA_MARKER_FILE}"
+guest_ip() {
+    awk -F= '/ZFSBOX_GUEST_IP=/{value=$2} END{print value}' "${SERIAL_LOG}" 2>/dev/null | tr -d '[:space:]'
 }
 
-apply_instance_config_if_needed() {
-    local needs_resource_update=0
-    local needs_mount_update=0
-    local edit_args=()
+wait_for_guest_ip() {
+    local waited=0
+    local guest_ip_value
 
-    if instance_needs_resource_update; then
-        needs_resource_update=1
-        edit_args+=(
-            --cpus="${VM_VCPUS}"
-            --memory="${LIMA_MEMORY_GIB}"
-        )
-    fi
+    while (( waited < VM_WAIT_TIMEOUT_SECONDS )); do
+        guest_ip_value="$(guest_ip)"
+        if [[ -n "${guest_ip_value}" ]]; then
+            printf '%s\n' "${guest_ip_value}"
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
 
-    if instance_needs_mount_update; then
-        needs_mount_update=1
-        edit_args+=(
-            --set
-            ".mounts = ${LIMA_VM_MOUNTS_JSON}"
-        )
-    fi
-
-    if [[ "${#edit_args[@]}" -eq 0 ]]; then
-        return
-    fi
-
-    if [[ "${needs_resource_update}" -eq 1 && "${needs_mount_update}" -eq 1 ]]; then
-        log "updating Lima instance ${INSTANCE_NAME} resources and mounts"
-    elif [[ "${needs_resource_update}" -eq 1 ]]; then
-        log "updating Lima instance ${INSTANCE_NAME} resources (cpus=${VM_VCPUS}, memory=${VM_MEMORY_MB}MiB)"
-    else
-        log "updating Lima instance ${INSTANCE_NAME} mounts"
-    fi
-
-    limactl "${LIMA_ARGS[@]}" stop "${INSTANCE_NAME}" >/dev/null 2>&1 || true
-    limactl "${LIMA_ARGS[@]}" edit "${edit_args[@]}" "${INSTANCE_NAME}" >/dev/null
-    write_lima_marker
+    echo "Timed out waiting for guest IP. See ${HELPER_LOG} and ${SERIAL_LOG}." >&2
+    exit 1
 }
 
-ensure_instance() {
-    if [[ "${LIMA_VM_RECREATE}" == "true" ]]; then
-        log "recreating Lima instance ${INSTANCE_NAME} because LIMA_VM_RECREATE=true"
-        limactl "${LIMA_ARGS[@]}" delete -f "${INSTANCE_NAME}" >/dev/null 2>&1 || true
-        rm -f "${LIMA_MARKER_FILE}"
-    elif [[ -f "${LIMA_CONFIG_FILE}" ]] && ! grep -Eq '^[[:space:]]*-[[:space:]]*vzNAT:[[:space:]]*true[[:space:]]*$' "${LIMA_CONFIG_FILE}"; then
-        log "recreating Lima instance ${INSTANCE_NAME} with host-reachable vzNAT networking"
-        limactl "${LIMA_ARGS[@]}" delete -f "${INSTANCE_NAME}" >/dev/null 2>&1 || true
-        rm -f "${LIMA_MARKER_FILE}"
-    fi
-
-    if limactl list 2>/dev/null | awk 'NR > 1 { print $1 }' | grep -qx "${INSTANCE_NAME}"; then
-        apply_instance_config_if_needed
-        log "starting Lima instance ${INSTANCE_NAME}"
-        limactl "${LIMA_ARGS[@]}" start "${INSTANCE_NAME}" >/dev/null 2>&1 || true
-        return
-    fi
-
-    log "creating Lima instance ${INSTANCE_NAME}"
-    limactl "${LIMA_ARGS[@]}" start \
-        --name="${INSTANCE_NAME}" \
-        --vm-type=vz \
-        --network=vzNAT \
-        --containerd=none \
-        --mount-type=virtiofs \
-        --mount-writable \
-        --cpus="${VM_VCPUS}" \
-        --memory="${LIMA_MEMORY_GIB}" \
-        --set ".mounts = ${LIMA_VM_MOUNTS_JSON}" \
-        template:default >/dev/null
-    write_lima_marker
+ssh_guest() {
+    local guest_ip_value="$1"
+    shift
+    ssh \
+        -F /dev/null \
+        -o BatchMode=yes \
+        -o ConnectTimeout=2 \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="${KNOWN_HOSTS}" \
+        -i "${HOST_KEY}" \
+        root@"${guest_ip_value}" \
+        "$@"
 }
 
-ensure_zfs() {
-    log "ensuring ZFS tooling is installed in the Lima guest"
-    limactl "${LIMA_ARGS[@]}" shell "${INSTANCE_NAME}" bash -lc '
+wait_for_ssh() {
+    local guest_ip_value="$1"
+    local waited=0
+
+    while (( waited < VM_WAIT_TIMEOUT_SECONDS )); do
+        if ssh_guest "${guest_ip_value}" true >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+
+    echo "Timed out waiting for guest SSH. See ${HELPER_LOG} and ${SERIAL_LOG}." >&2
+    exit 1
+}
+
+ensure_guest_ready() {
+    local guest_ip_value="$1"
+
+    ssh_guest "${guest_ip_value}" "bash -lc '
 set -Eeuo pipefail
-
+if command -v cloud-init >/dev/null 2>&1; then
+  cloud-init status --wait >/dev/null 2>&1 || true
+fi
 if ! command -v zpool >/dev/null 2>&1; then
-    sudo env NEEDRESTART_MODE=a apt-get update >/dev/null 2>&1
-    sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y zfsutils-linux >/dev/null 2>&1
+  env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update >/dev/null 2>&1
+  env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y zfsutils-linux >/dev/null 2>&1
 fi
-
 if ! command -v exportfs >/dev/null 2>&1; then
-    sudo env NEEDRESTART_MODE=a apt-get update >/dev/null 2>&1
-    sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y nfs-kernel-server >/dev/null 2>&1
+  env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y nfs-kernel-server >/dev/null 2>&1
 fi
-
-sudo modprobe zfs >/dev/null 2>&1 || true
-' >/dev/null
+modprobe zfs >/dev/null 2>&1 || true
+'>" >/dev/null 2>&1
 }
 
-load_mount_configuration
-validate_visible_paths "$@"
-ensure_instance
-ensure_zfs
+ensure_vm() {
+    local -a attachments=("$@")
+    local attachment
+    local needs_root=0
 
-exec limactl "${LIMA_ARGS[@]}" shell "${INSTANCE_NAME}" sudo "$@"
+    init_dirs
+    ensure_dependencies
+    ensure_host_key
+    compile_helper
+    ensure_base_image
+    build_seed_image
+
+    for attachment in "${attachments[@]}"; do
+        if attachment_needs_root "${attachment}"; then
+            needs_root=1
+            break
+        fi
+    done
+
+    if attachments_changed "${attachments[@]}"; then
+        stop_vm
+    fi
+
+    if ! vm_running; then
+        log "starting native macOS VM"
+        start_vm "${needs_root}" "${attachments[@]}"
+    fi
+
+    local guest_ip_value
+    guest_ip_value="$(wait_for_guest_ip)"
+    wait_for_ssh "${guest_ip_value}"
+    ensure_guest_ready "${guest_ip_value}"
+}
+
+main() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: $(basename "$0") <command> [args...]" >&2
+        exit 1
+    fi
+
+    mapfile -t ATTACHMENTS < <(compute_attachment_set "$@")
+    mapfile -t TRANSLATED_ARGS < <(translate_args "$@")
+
+    ensure_vm "${ATTACHMENTS[@]}"
+    exec ssh_guest "$(wait_for_guest_ip | tr -d '[:space:]')" sudo "${TRANSLATED_ARGS[@]}"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

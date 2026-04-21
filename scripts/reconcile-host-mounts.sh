@@ -14,6 +14,7 @@ if [[ -f "${ENV_FILE}" ]]; then
 fi
 
 LIMA_INSTANCE_NAME="${LIMA_INSTANCE_NAME:-${INSTANCE_NAME:-zfsbox-zfs}}"
+MACOS_VZ_STATE_DIR="${STATE_DIR}/macos-vz"
 mkdir -p "${STATE_DIR}"
 
 log() {
@@ -126,7 +127,7 @@ guest_exec() {
     local script="$1"
 
     if [[ "${host_os}" == "Darwin" ]]; then
-        limactl --log-level=error -y shell "${LIMA_INSTANCE_NAME}" bash -lc "${script}"
+        "${PROJECT_DIR}/scripts/macos-lima-zfs-exec.sh" bash -lc "${script}"
     else
         linux_qemu_guest_exec bash -lc "${script}"
     fi
@@ -136,7 +137,7 @@ guest_sudo_exec() {
     local script="$1"
 
     if [[ "${host_os}" == "Darwin" ]]; then
-        limactl --log-level=error -y shell "${LIMA_INSTANCE_NAME}" sudo bash -lc "${script}"
+        "${PROJECT_DIR}/scripts/macos-lima-zfs-exec.sh" bash -lc "${script}"
     else
         guest_exec "${script}"
     fi
@@ -447,7 +448,7 @@ if [[ -z "${host_client_ip}" ]]; then
 fi
 
 if [[ "${host_os}" == "Darwin" ]]; then
-guest_ip="$(guest_exec "ip -4 route get ${host_client_ip} | awk '{for (i = 1; i <= NF; i++) if (\$i == \"src\") {print \$(i + 1); exit}}'" | tr -d '[:space:]')"
+    guest_ip="${GUEST_FIXED_IP:-192.168.64.254}"
 else
     guest_ip="${LINUX_QEMU_GUEST_HOST:-127.0.0.1}"
 fi
