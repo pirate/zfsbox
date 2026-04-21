@@ -321,7 +321,7 @@ wait_for_nfs() {
     if [[ "${host_os}" == "Darwin" ]]; then
         nc -G 2 -z "${guest_ip}" 2049 >/dev/null 2>&1
     else
-        nc -w 2 -z 127.0.0.1 "${VM_NFS_PORT}" >/dev/null 2>&1
+        nc -w 2 -z "${guest_ip}" "${VM_NFS_PORT}" >/dev/null 2>&1
     fi
 }
 
@@ -360,7 +360,7 @@ mount_pool() {
         host_root_run /sbin/mount_nfs -o vers=3,tcp,nolocks "${source}" "${target}"
     else
         target="/mnt/${pool}"
-        source="127.0.0.1:/${pool}"
+        source="${guest_ip}:/${pool}"
         if [[ "${SKIP_HOST_MOUNTS}" == "1" ]]; then
             echo "dry-run mount ${source} -> ${target}" >&2
             return
@@ -370,7 +370,7 @@ mount_pool() {
             exit 1
         fi
         if ! wait_for_nfs "${guest_ip}"; then
-            echo "Guest NFS server at 127.0.0.1:${VM_NFS_PORT} is not reachable from the Linux host." >&2
+            echo "Guest NFS server at ${guest_ip}:${VM_NFS_PORT} is not reachable from the Linux host." >&2
             exit 1
         fi
         host_root_run mkdir -p "${target}"
@@ -449,7 +449,7 @@ fi
 if [[ "${host_os}" == "Darwin" ]]; then
 guest_ip="$(guest_exec "ip -4 route get ${host_client_ip} | awk '{for (i = 1; i <= NF; i++) if (\$i == \"src\") {print \$(i + 1); exit}}'" | tr -d '[:space:]')"
 else
-    guest_ip="127.0.0.1"
+    guest_ip="${LINUX_QEMU_GUEST_HOST:-127.0.0.1}"
 fi
 
 if [[ -z "${guest_ip}" ]]; then

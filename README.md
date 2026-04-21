@@ -1,127 +1,55 @@
-# 🗄️ `zfsbox`<br/> Run virtualized ZFS from userspace on macOS/Linux<br/><small>(without needing to install ZFS kernel modules!)</small>
+# 🗄️ `zfsbox`<br/> Run ZFS from userspace on macOS/Linux<br/><small>(without needing to install ZFS kernel modules on the host)</small>
 
-> 🐚 Run ZFS in a Linux VM using host-backed storage and expose pools back to the host under `/mnt` or `/Volumes` via NFS.
+> Magic `zpool` and `zfs` wrappers that make ZFS "just work" macOS, Linux, and Docker *without* needing the ZFS kernel module installed.
 
-`zfsbox` is a host-side wrapper around a Linux ZFS environment.
+`zfsbox` works by running the actual ZFS kernel module inside a small linux VM, and exposing the mounts back to the host over NFSv4.
 
-- On **macOS**, it runs ZFS inside a **Lima `vz` guest** (using native macOS hypervisor framework) and mounts pool roots back onto the host at `/Volumes/<pool>`.
-- On **Linux**, it runs a **rootless QEMU guest** with host path passthrough and automatic host mounts under `/mnt/<pool>`.
+It allows you to run ZFS on macOS, Linux, or in Docker containers without having to mess around with FUSE, `/dev/zfs`, `dkms`, or `privileged: true`.
 
-The current sweet spot is:
-
-- create a sparse file on your host
-- use it directly as a ZFS file vdev from inside the guest
-- manage pools with `zpool` / `zfs` from your host shell
-- access the mounted pool root on your host filesystem
+## What
 
 ## ✨ Features
 
 - Host-side `zpool` and `zfs` wrappers
-- macOS-backed pools using host files under `${HOME}` or `/Volumes`
-- Linux-backed pools using arbitrary absolute host paths under `/`
+- macOS-backed pools using block devices or files under `${HOME}`, `/Volumes`, or `/dev`
+- Linux-backed pools using block devices or files anywhere under `/` or `/dev`.
 - automatic host mounts at `/Volumes/<pool>` on macOS
 - automatic host mounts at `/mnt/<pool>` on Linux
-- visible `.zfs/snapshot` trees on host mounts
-- snapshot / clone / send / receive workflows through real ZFS tooling
-- no Docker required on macOS or Linux
-
-## 🧭 Architecture
-
-### macOS
-
-```text
-macOS `./bin/zfsbox-zpool`       (does not need to have ZFS installed)
-  -> Lima Linux VM (vmType: vz, virtiofs, vzNAT)
-    -> OpenZFS kernel module
-    -> NFSv4 server to allow mounting /Volumes/<pool> on macOS host
-```
-
-*See below for Docker usage.*
-
-### Linux
-
-```text
-Linux `./bin/zfsbox-zpool`       (does not need to have ZFS installed)
-  -> QEMU Linux VM (rootless, /dev/kvm when available)
-    -> OpenZFS kernel module
-    -> NFSv4 server to allow mounting /mnt/<pool> on Linux host
-```
-
-### Docker
-
-```text
-Host OS                (does not need to have ZFS installed)
-  -> Docker zfsbox container
-    -> QEMU/KVM VM     (runs ZFS kernel module inside VM)
-      -> OpenZFS kernel module
-      -> NFSv4 server to allow mounting /mnt/<pool> inside/outside Docker
-```
-
-Use the provided [`docker-compose.yml`](./docker-compose.yml) directly.
-
-```bash
-mkdir -p data mnt
-truncate -s 10G ./data/test2.zpool
-docker compose run --rm zfsbox zpool create test2 /data/test2.zpool
-docker compose run --rm zfsbox sh -lc 'echo test > /mnt/test2/test.txt'
-docker compose run --rm zfsbox cat /mnt/test2/test.txt
-docker compose run --rm zfsbox zfs set snapdir=visible test2
-docker compose run --rm zfsbox zfs snapshot test2@latest
-docker compose run --rm zfsbox cat /mnt/test2/.zfs/snapshot/latest/test.txt
-
-# Or keep the server up and mount the same pool on the outer host.
-docker compose up -d
-./bin/zfsbox-mount 127.0.0.1:12049 test2 ./mnt/test2
-cat ./mnt/test2/test.txt
-cat ./mnt/test2/.zfs/snapshot/latest/test.txt
-```
-
-Notes:
-
-- VM runtime state is stored automatically under `./data/.zfsbox/state`, so separate `docker compose run ...` and `docker compose up ...` invocations reuse the same known pools and datasets.
-- `./bin/zfsbox-mount` mounts the exported NFS path on the outer host using the right macOS/Linux mount command for that host.
-- Use <https://www.composerize.com/> if you prefer `docker run ...` instead of `docker compose ...`.
+- fully working `zfs send`, `zfs recv`, `zfs snapshot` + `.zfs/snapshot` dirs on host mounts, and more
+- work inside Docker, Docker Compose, Docker Desktop, and Kubernetes as well (on Linux, macOS, and Windows hosts *without* needing ZFS installed in Docker VM)
 
 ## 🚀 Quick Start
 
-### 1. Load the aliases
+### 1. Load the `zpool` and `zfs` command aliases (optional)
 
 ```bash
-cd /path/to/zfsbox
+git clone https://github.com/pirate/zfsbox.git && zfsbox
+
 source ./zfsbox.aliases.sh
 ```
 
-This overrides `zfs` and `zpool` in the current shell only.
+This points `zfs` and `zpool` in the current shell to `./bin/zfsbox-zfs` and `./bin/zfsbox-zpool`.
 
-Optional macOS Lima overrides in `.env`:
+(Not strictly necessary, you can also run `./bin/zfsbox-zpool ...` & `./bin/zfsbox-zfs ...` directly)
 
-```bash
-LIMA_VM_RECREATE=true
-LIMA_VM_MOUNTS=[{"location":"/Users/you","writable":true},{"location":"/Volumes","writable":true}]
-```
-
-Both are optional. `LIMA_VM_RECREATE=true` forces the next run to rebuild the Lima instance from scratch. `LIMA_VM_MOUNTS` overrides the default `${HOME}` and `/Volumes` mounts with a JSON array of Lima mount objects. For `zfsbox`, each mount must resolve to the same guest path as its host `location`; if `mountPoint` is omitted, `zfsbox` fills it in automatically.
-
-### 2. Create a backing file on the host
+### 2. Create a backing file on the host (optional)
 
 ```bash
 truncate -s 10G ~/Desktop/testpool.zpool
 ```
 
-(only needed if you want to use a file for the pool backing store instead of a `/dev/disk`)
+This is only needed if you want to use a file to store pool data (recommended) instead of a raw block device like `/dev/diskN`.
 
 ### 3. Create a pool
 
 ```bash
 zpool create test ~/Desktop/testpool.zpool   # using a file to store the pool data
-
 # or
-
 zpool create test /dev/disk8 ...             # using real disk(s) for the pool vdevs
 ```
 
-On macOS and linux, first run may request `sudo` permissions. 
-Root permissions are only used to mount the pools/datasets under `/Volumes` or `/mnt`, you can run `zfsbox` `zpool`/`zfs` commands fully rootless if you don't need to mount anything.
+On macOS and Linux, the first run may request `sudo` permissions.
+Root permissions are used to mount pool roots under `/Volumes` or `/mnt`; the `zpool` / `zfs` commands themselves stay rootless if you do not need host mounts.
 
 ### 4. Use it from the host
 
@@ -140,6 +68,36 @@ ls -la /mnt/test
 echo hello > /mnt/test/test.txt
 cat /mnt/test/test.txt
 ```
+
+## 🐳 Docker Usage
+
+Use the provided [`docker-compose.yml`](./docker-compose.yml) in this repo as a template to modify.
+
+Basic usage:
+
+```bash
+mkdir -p data mnt
+truncate -s 10G ./data/test2.zpool
+
+docker compose exec zfsbox zpool create test2 /data/test2.zpool
+docker compose exec zfsbox sh -lc 'echo test > /mnt/test2/test.txt'
+docker compose exec zfsbox cat /mnt/test2/test.txt
+docker compose exec zfsbox zfs set snapdir=visible test2
+docker compose exec zfsbox zfs snapshot test2@latest
+docker compose exec zfsbox ls /mnt/test2/.zfs/snapshot/latest
+docker compose exec zfsbox cat /mnt/test2/.zfs/snapshot/latest/test.txt
+
+# optionally mount it on the host outside of docker
+docker compose up -d   # starts the background nfsv4 server to allow mounting
+./bin/zfsbox-mount 127.0.0.1:12049 test2 ./mnt/test2
+cat ./mnt/test2/test.txt
+cat ./mnt/test2/.zfs/snapshot/latest/test.txt
+```
+
+Notes:
+
+- Runtime state is stored automatically under `./data/.zfsbox/state`, so separate `docker compose run ...` and `docker compose up ...` invocations reuse the same known pools and datasets.
+- Use <https://www.composerize.com/> if you prefer `docker run ...` instead of `docker compose ...`.
 
 ## 📸 Snapshots
 
@@ -197,7 +155,7 @@ zfs receive restored < /tmp/test.send
 
 ```bash
 zpool destroy test
-rm ~/Desktop/testpool.zpool
+rm ~/Desktop/testpool.zpool   # dont forget to delete any backing file (if a file was used)
 ```
 
 ## 🛠 Commands
@@ -217,26 +175,164 @@ zpool status
 zfs list
 ```
 
+## Architecture
+
+The sections below describe how each mode is actually implemented, what knobs exist, what the performance tradeoffs look like, and exactly when root permissions are used.
+
+<details>
+<summary><h3>How it works on macOS</h3></summary>
+
+**Diagram**
+
+```text
+macOS `./bin/zfsbox-zpool`       (does not need to have ZFS installed)
+  -> Lima Linux VM (vmType: vz, virtiofs, vzNAT)
+    -> OpenZFS kernel module
+    -> NFSv4 server to allow mounting /Volumes/<pool> on macOS host
+```
+
+**Details and tradeoffs**
+
+This is the native macOS host path. `zfsbox` uses Lima directly with `vz`, `virtiofs`, and `vzNAT`, then runs ZFS and the export server inside that environment. Absolute host paths only work if they are visible inside the runtime; by default `zfsbox` exposes `${HOME}` and `/Volumes`, and `LIMA_VM_MOUNTS` can override that mount set.
+
+The tradeoff is straightforward: this keeps the macOS host clean and avoids any host-side ZFS install, but it means backing files and visible paths have to live inside the mounted path set. Host-visible mounts are implemented by exporting guest mountpoints back to macOS and mounting them at `/Volumes/<pool>`, so mount reconciliation can trigger Touch ID or `sudo` re-auth when macOS needs to re-establish those mounts.
+
+**Mode-specific config**
+
+- CLI flags: none. macOS mode is selected automatically on macOS hosts.
+- Env vars:
+  - `LIMA_INSTANCE_NAME`: name of the managed Lima instance.
+  - `VM_MEMORY_MB`: memory budget.
+  - `VM_VCPUS`: CPU count.
+  - `LIMA_VM_RECREATE=true|false`: force the next run to delete and recreate the instance from scratch.
+  - `LIMA_VM_MOUNTS=[...]`: JSON array of Lima mount objects. Each mount must resolve to the same guest path as its host `location`, and if `mountPoint` is omitted `zfsbox` fills it in automatically.
+  - `ZFSBOX_STATE_DIR`: state root; macOS-specific state is kept under `.../macos-lima`.
+- Compatibility fallback:
+  - `INSTANCE_NAME` is accepted as a fallback source for the instance name when `LIMA_INSTANCE_NAME` is not set.
+
+**Performance and tunables**
+
+This is the best default path on macOS because it uses the native host hypervisor stack rather than a nested Docker workflow. First run is slower because the environment may need to install ZFS and NFS tooling before it is ready. After that, the main knobs are `VM_MEMORY_MB` and `VM_VCPUS`.
+
+If you are working with large host trees, keeping `LIMA_VM_MOUNTS` tight helps reduce the exposed surface area. Putting `ZFSBOX_STATE_DIR` on a fast local disk also helps because it stores the persistent instance marker and related runtime state.
+
+**When root is used**
+
+`sudo` is never used on the macOS host to install ZFS or load any host kernel module. Host root is only used to create, mount, unmount, or clean up `/Volumes/<pool>` mountpoints. Inside the managed environment, root is used to install `zfsutils-linux` and `nfs-kernel-server`, run `modprobe zfs`, and manage guest exports. If you do not need host-visible mounts, the user-facing `zpool` / `zfs` commands stay rootless on the macOS host.
+
+</details>
+
+<details>
+<summary><h3>How it works on Linux</h3></summary>
+
+**Diagram**
+
+```text
+Linux `./bin/zfsbox-zpool`       (does not need to have ZFS installed)
+  -> QEMU Linux VM (rootless, /dev/kvm when available)
+    -> OpenZFS kernel module
+    -> NFSv4 server to allow mounting /mnt/<pool> on Linux host
+```
+
+**Details and tradeoffs**
+
+This is the native Linux host path. `zfsbox` starts a rootless QEMU guest, shares host `/` into it once, and rewrites absolute host paths to `${LINUX_QEMU_HOST_ROOT_MOUNT}` automatically so the guest can use normal host files and disks. Known pool paths are tracked under the Linux state directory, and the guest image, overlay, seed image, SSH key, and serial log all live under `state/linux-qemu` unless you override `ZFSBOX_STATE_DIR`.
+
+The tradeoff here is that the guest itself stays rootless on the host, but host-visible mounts are still returned via guest-side NFS and mounted under `/mnt/<pool>`. `/dev/kvm` is optional for acceleration but not required for correctness. When it is missing or inaccessible, the guest falls back to software emulation and the whole stack becomes slower but still functional.
+
+**Mode-specific config**
+
+- CLI flags: none. Linux mode is selected automatically on Linux hosts.
+- Env vars:
+  - `LINUX_QEMU_VM_NAME`: guest name passed to QEMU.
+  - `LINUX_QEMU_HOST_SHARE`: host path shared into the guest. Default is `/`.
+  - `LINUX_QEMU_HOST_ROOT_MOUNT`: mountpoint inside the guest where the host share appears. Default is `/host`.
+  - `VM_SSH_PORT`: forwarded localhost SSH port used to manage the guest.
+  - `VM_NFS_PORT`: forwarded localhost NFS port used for host mounts.
+  - `VM_MEMORY_MB`: memory budget.
+  - `VM_VCPUS`: CPU count.
+  - `GUEST_RELEASE`: Ubuntu cloud image release.
+  - `LINUX_QEMU_WAIT_TIMEOUT`: guest readiness timeout in seconds.
+  - `LINUX_QEMU_QEMU_BIN`: override the QEMU system binary.
+  - `LINUX_QEMU_BUNDLED_BASE_IMAGE`: override the bundled cloud image path.
+  - `LINUX_QEMU_ARM64_UEFI_FD`: override the ARM64 UEFI firmware path.
+  - `ZFSBOX_STATE_DIR`: state root; Linux-specific state is kept under `.../linux-qemu`.
+- Advanced/internal override:
+  - `LINUX_QEMU_LAYOUT_VERSION` exists for layout invalidation and migration. You should not need to touch it in normal use.
+
+**Performance and tunables**
+
+With `/dev/kvm` available and accessible, this path is the fastest Linux configuration because QEMU can use hardware acceleration. Without KVM it falls back to `tcg`, which is correct but slower. First run is also slower because `zfsbox` may need to download the base Ubuntu cloud image, generate cloud-init data, and let the guest install `openssh-server`, `nfs-kernel-server`, and `zfsutils-linux`.
+
+The main performance knobs are `VM_MEMORY_MB` and `VM_VCPUS`. `ZFSBOX_STATE_DIR` on a fast disk helps because the base image, overlay, seed image, and serial log live there. Narrowing `LINUX_QEMU_HOST_SHARE` from `/` to a smaller subtree can also reduce how much host filesystem surface is exposed into the guest.
+
+**When root is used**
+
+The QEMU guest itself is started rootlessly. `sudo` is never used on the Linux host to install ZFS or load a host kernel module. Host root is only used to create, mount, unmount, or clean up `/mnt/<pool>` mountpoints. Inside the guest, root is used to mount the host share at `${LINUX_QEMU_HOST_ROOT_MOUNT}`, manage ZFS, install guest packages, run `modprobe zfs`, and manage guest exports. If `ZFSBOX_SKIP_HOST_MOUNTS=1`, even the host-side mount step can be skipped.
+
+</details>
+
+<details>
+<summary><h3>How it works in Docker</h3></summary>
+
+**Diagram**
+
+```text
+Host OS                (does not need to have ZFS installed)
+  -> Docker zfsbox container
+    -> QEMU/KVM VM     (runs ZFS kernel module inside VM)
+      -> OpenZFS kernel module
+      -> NFSv4 server to allow mounting /mnt/<pool> inside/outside Docker
+```
+
+**Details and tradeoffs**
+
+Docker mode wraps the Linux backend inside a long-lived container. The checked-in compose file binds `./data` to `/data`, so pool files, runtime state, and mount helper state all survive across `docker compose run ...`, `docker compose exec ...`, and `docker compose up ...` flows. `./bin/zfsbox-mount` can then mount the same exported pool on the outer host when port `12049` is published on `127.0.0.1`.
+
+The tradeoff is that Docker mode is convenient and self-contained, but it adds another layer around the Linux backend. On a Linux Docker host, optional `/dev/kvm` passthrough can accelerate the guest substantially. On Docker Desktop or any environment without KVM passthrough, it falls back to software emulation and first boot is noticeably slower. The compose file is intentionally minimal and keeps the service alive with `sleep infinity` so you can use `docker compose exec ...` against a warm runtime.
+
+**Mode-specific config**
+
+- CLI flags: none. Use normal `docker compose ...` or `docker run ...` arguments around the container.
+- Compose options in the checked-in `docker-compose.yml`:
+  - `build: .`
+  - `image: ghcr.io/pirate/zfsbox:latest`
+  - `cap_add: [SYS_ADMIN]`
+  - `ports: ["127.0.0.1:12049:12049"]`
+  - `command: ["sleep", "infinity"]`
+  - `working_dir: /data`
+  - `volumes: ["./data:/data"]`
+- Env vars you can pass into the container:
+  - All Linux backend vars apply here as well, including `GUEST_RELEASE`, `VM_MEMORY_MB`, `VM_VCPUS`, `VM_SSH_PORT`, `VM_NFS_PORT`, `LINUX_QEMU_VM_NAME`, `LINUX_QEMU_HOST_SHARE`, `LINUX_QEMU_HOST_ROOT_MOUNT`, `LINUX_QEMU_WAIT_TIMEOUT`, and `ZFSBOX_STATE_DIR`.
+  - `ZFSBOX_SKIP_HOST_MOUNTS=1`: skip automatic mounts inside the container and just manage pools/datasets.
+- Common optional YAML additions when you need them:
+  - `/dev/kvm:/dev/kvm` on Linux Docker hosts for guest acceleration.
+  - raw disk device mappings if you want to hand real block devices to `zpool create` instead of files.
+
+**Performance and tunables**
+
+The main performance knobs are still `VM_MEMORY_MB` and `VM_VCPUS`. Keeping `./data` on fast local storage helps because it holds both pool backing files and the persistent runtime state under `./data/.zfsbox/state`. On Linux hosts, adding `/dev/kvm` is the big acceleration switch. On Docker Desktop and similar environments without KVM passthrough, expect slower first boot because the guest is fully emulated and still has to provision its own packages on first run.
+
+`docker compose run --rm ...` and `docker compose up ...` reuse the same persisted state as long as `./data` is the same bind mount, so repeated runs avoid reprovisioning once the runtime is warm.
+
+**When root is used**
+
+The container runs as root inside the container by default, but that does not mean `zfsbox` is installing ZFS on the outer host. `cap_add: SYS_ADMIN` is only needed so `zfsbox` can mount `/mnt/<pool>` inside the container. Without it, `zpool` / `zfs` commands still work and the export is still available; you just need to mount it elsewhere, either with `./bin/zfsbox-mount` on the outer host or with a manual mount or Docker NFS volume.
+
+If you publish `127.0.0.1:12049:12049`, the outer host can mount the same pool through `./bin/zfsbox-mount`. On the outer host, root is only used for the actual mount command and mountpoint management; it is never used to install host ZFS or load a host ZFS kernel module.
+
+</details>
+
 ## 📁 Important Files
 
 - [`bin/zfsbox-zpool`](./bin/zfsbox-zpool): host-side `zpool` wrapper
 - [`bin/zfsbox-zfs`](./bin/zfsbox-zfs): host-side `zfs` wrapper
 - [`bin/zfsbox-guest-exec`](./bin/zfsbox-guest-exec): OS switchboard into the supported guest runner
-- [`scripts/macos-lima-zfs-exec.sh`](./scripts/macos-lima-zfs-exec.sh): macOS Lima execution path
-- [`scripts/linux-qemu-zfs-exec.sh`](./scripts/linux-qemu-zfs-exec.sh): Linux rootless QEMU execution path
+- [`scripts/macos-lima-zfs-exec.sh`](./scripts/macos-lima-zfs-exec.sh): macOS execution path
+- [`scripts/linux-qemu-zfs-exec.sh`](./scripts/linux-qemu-zfs-exec.sh): Linux execution path
 - [`scripts/linux-qemu-common.sh`](./scripts/linux-qemu-common.sh): Linux guest lifecycle / cloud-init / SSH bootstrap
 - [`scripts/reconcile-host-mounts.sh`](./scripts/reconcile-host-mounts.sh): mounts guest filesystems back onto the host
 - [`zfsbox.aliases.sh`](./zfsbox.aliases.sh): shell aliases / functions
-
-## ⚠️ Notes
-
-- macOS uses **Lima directly** with `vz`, `virtiofs`, and `vzNAT`.
-- Host-backed file vdevs must live under paths mounted into the guest. By default the macOS wrapper exposes `${HOME}` and `/Volumes`, and `LIMA_VM_MOUNTS` can override that mount set.
-- The current Linux wrapper shares host `/` into the guest once and rewrites absolute host paths to `/host/...` automatically.
-- Host-visible pool mounts are implemented with **guest-side NFS** on macOS and **guest-side NFSv4 over localhost port forwarding** on Linux.
-- macOS host mountpoints under `/Volumes/<pool>` may require re-auth with Touch ID when reconciling mounts.
-- On Linux, `/dev/kvm` is optional for acceleration but not required for correctness; `/mnt/<pool>` preparation is the only step that needs `sudo`.
-- The current Linux runner expects QEMU system emulation, `qemu-img`, one cloud-init seed-image builder, and host NFS client tools.
 
 ## 📚 References
 

@@ -11,7 +11,13 @@ fi
 mkdir -p "${ZFSBOX_STATE_DIR:-/data/.zfsbox/state}"
 
 if [[ "$(uname -s)" == "Linux" ]]; then
-    "${PROJECT_DIR}/scripts/reconcile-host-mounts.sh"
+    state_root="${ZFSBOX_STATE_DIR:-/data/.zfsbox/state}"
+    known_pools_file="${state_root}/linux-qemu/known-pool-paths.tsv"
+    known_mounts_file="${state_root}/host-mounts.linux.txt"
+
+    if [[ -s "${known_pools_file}" || -s "${known_mounts_file}" ]]; then
+        "${PROJECT_DIR}/scripts/reconcile-host-mounts.sh"
+    fi
 fi
 
 exec "$@"

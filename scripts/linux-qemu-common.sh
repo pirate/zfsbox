@@ -39,9 +39,25 @@ VM_NFS_PORT="${VM_NFS_PORT:-12049}"
 VM_MEMORY_MB="${VM_MEMORY_MB:-2048}"
 VM_VCPUS="${VM_VCPUS:-2}"
 GUEST_RELEASE="${GUEST_RELEASE:-noble}"
+LINUX_QEMU_GUEST_HOST="${LINUX_QEMU_GUEST_HOST:-127.0.0.1}"
 
 linux_qemu_log() {
     printf 'zfsbox: %s\n' "$*" >&2
+}
+
+linux_qemu_inside_container() {
+    [[ -f /.dockerenv ]]
+}
+
+linux_qemu_ssh_run() {
+    local timeout_seconds="${LINUX_QEMU_SSH_TIMEOUT_SECONDS:-10}"
+
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${timeout_seconds}" ssh "$@"
+        return
+    fi
+
+    ssh "$@"
 }
 
 linux_qemu_require_linux() {
@@ -378,6 +394,10 @@ linux_qemu_is_running() {
 
 linux_qemu_start_vm() {
     local accel
+    local stderr_file status=0
+
+    stderr_file="$(mktemp)"
+    trap 'rm -f "${stderr_file}"' RETURN
 
     accel="tcg"
     if [[ -r /dev/kvm && -w /dev/kvm ]]; then
@@ -411,25 +431,72 @@ linux_qemu_start_vm() {
             -device virtio-blk-device,drive=rootfs \
             -drive "if=none,format=raw,file=${LINUX_QEMU_SEED_IMAGE},id=seed" \
             -device virtio-blk-device,drive=seed \
-            -virtfs "local,id=hostroot,path=${LINUX_QEMU_HOST_SHARE},mount_tag=hostroot,security_model=none,multidevs=remap"
-        return
+            -virtfs "local,id=hostroot,path=${LINUX_QEMU_HOST_SHARE},mount_tag=hostroot,security_model=none,multidevs=remap" \
+            2>"${stderr_file}" || status=$?
+    else
+        "${LINUX_QEMU_QEMU_BIN}" \
+            -name "${LINUX_QEMU_VM_NAME}" \
+            -machine "${LINUX_QEMU_MACHINE},accel=${accel}" \
+            -cpu "${LINUX_QEMU_CPU}" \
+            -smp "${VM_VCPUS}" \
+            -m "${VM_MEMORY_MB}" \
+            -display none \
+            -serial "file:${LINUX_QEMU_SERIAL_LOG}" \
+            -daemonize \
+            -pidfile "${LINUX_QEMU_PID_FILE}" \
+            -device virtio-rng-pci \
+            -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22,hostfwd=tcp:127.0.0.1:${VM_NFS_PORT}-:2049" \
+            -drive "if=virtio,format=qcow2,file=${LINUX_QEMU_OVERLAY_IMAGE}" \
+            -drive "if=virtio,format=raw,media=cdrom,file=${LINUX_QEMU_SEED_IMAGE}" \
+            -virtfs "local,id=hostroot,path=${LINUX_QEMU_HOST_SHARE},mount_tag=hostroot,security_model=none,multidevs=remap" \
+            2>"${stderr_file}" || status=$?
     fi
 
-    "${LINUX_QEMU_QEMU_BIN}" \
-        -name "${LINUX_QEMU_VM_NAME}" \
-        -machine "${LINUX_QEMU_MACHINE},accel=${accel}" \
-        -cpu "${LINUX_QEMU_CPU}" \
-        -smp "${VM_VCPUS}" \
-        -m "${VM_MEMORY_MB}" \
-        -display none \
-        -serial "file:${LINUX_QEMU_SERIAL_LOG}" \
-        -daemonize \
-        -pidfile "${LINUX_QEMU_PID_FILE}" \
-        -device virtio-rng-pci \
-        -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22,hostfwd=tcp:127.0.0.1:${VM_NFS_PORT}-:2049" \
-        -drive "if=virtio,format=qcow2,file=${LINUX_QEMU_OVERLAY_IMAGE}" \
-        -drive "if=virtio,format=raw,media=cdrom,file=${LINUX_QEMU_SEED_IMAGE}" \
-        -virtfs "local,id=hostroot,path=${LINUX_QEMU_HOST_SHARE},mount_tag=hostroot,security_model=none,multidevs=remap"
+    if [[ "${status}" -ne 0 ]]; then
+        if grep -Fq 'Failed to get "write" lock' "${stderr_file}"; then
+            if linux_qemu_try_use_shared_vm; then
+                return 0
+            fi
+
+            cat >&2 <<EOF
+zfsbox: this VM state is already in use by another container.
+If a background service is already running, reuse it with:
+  docker compose exec zfsbox ...
+Otherwise stop the other container before starting a new VM.
+EOF
+            return 1
+        fi
+
+        cat "${stderr_file}" >&2
+        return "${status}"
+    fi
+}
+
+linux_qemu_try_use_shared_vm() {
+    local candidate_host="host.docker.internal"
+
+    linux_qemu_inside_container || return 1
+
+    if ! getent hosts "${candidate_host}" >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if ssh \
+        -F /dev/null \
+        -o BatchMode=yes \
+        -o ConnectTimeout=2 \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="${LINUX_QEMU_KNOWN_HOSTS}" \
+        -i "${LINUX_QEMU_HOST_KEY}" \
+        -p "${VM_SSH_PORT}" \
+        root@"${candidate_host}" \
+        "mountpoint -q ${LINUX_QEMU_HOST_ROOT_MOUNT} && command -v zpool >/dev/null 2>&1" \
+        >/dev/null 2>&1; then
+        LINUX_QEMU_GUEST_HOST="${candidate_host}"
+        return 0
+    fi
+
+    return 1
 }
 
 linux_qemu_wait_for_guest() {
@@ -437,7 +504,7 @@ linux_qemu_wait_for_guest() {
     local timeout="${LINUX_QEMU_WAIT_TIMEOUT:-600}"
 
     while (( waited < timeout )); do
-        if ssh \
+        if linux_qemu_ssh_run \
             -F /dev/null \
             -o BatchMode=yes \
             -o ConnectTimeout=2 \
@@ -445,8 +512,8 @@ linux_qemu_wait_for_guest() {
             -o UserKnownHostsFile="${LINUX_QEMU_KNOWN_HOSTS}" \
             -i "${LINUX_QEMU_HOST_KEY}" \
             -p "${VM_SSH_PORT}" \
-            root@127.0.0.1 \
-            "mountpoint -q ${LINUX_QEMU_HOST_ROOT_MOUNT} && command -v zpool >/dev/null 2>&1" \
+            root@"${LINUX_QEMU_GUEST_HOST}" \
+            "mountpoint -q ${LINUX_QEMU_HOST_ROOT_MOUNT}" \
             >/dev/null 2>&1; then
             return 0
         fi
@@ -459,6 +526,36 @@ linux_qemu_wait_for_guest() {
     exit 1
 }
 
+linux_qemu_ensure_guest_tools() {
+    LINUX_QEMU_SSH_TIMEOUT_SECONDS="${LINUX_QEMU_GUEST_SETUP_TIMEOUT_SECONDS:-900}" linux_qemu_ssh_run \
+        -F /dev/null \
+        -o BatchMode=yes \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="${LINUX_QEMU_KNOWN_HOSTS}" \
+        -i "${LINUX_QEMU_HOST_KEY}" \
+        -p "${VM_SSH_PORT}" \
+        root@"${LINUX_QEMU_GUEST_HOST}" \
+        "bash -lc '
+set -Eeuo pipefail
+
+if command -v cloud-init >/dev/null 2>&1; then
+    cloud-init status --wait >/dev/null 2>&1 || true
+fi
+
+if ! command -v zpool >/dev/null 2>&1; then
+    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update >/dev/null 2>&1
+    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y zfsutils-linux >/dev/null 2>&1
+fi
+
+if ! command -v exportfs >/dev/null 2>&1; then
+    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update >/dev/null 2>&1
+    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y nfs-kernel-server >/dev/null 2>&1
+fi
+
+modprobe zfs >/dev/null 2>&1 || true
+'"
+}
+
 linux_qemu_ensure_vm_running() {
     linux_qemu_require_linux
     linux_qemu_init_dirs
@@ -466,13 +563,19 @@ linux_qemu_ensure_vm_running() {
     linux_qemu_prepare_arch_assets
     linux_qemu_download_base_image
     linux_qemu_ensure_host_key
+
+    if linux_qemu_try_use_shared_vm; then
+        return
+    fi
+
     linux_qemu_reset_instance_if_needed
 
     if ! linux_qemu_is_running; then
-        linux_qemu_start_vm
+        linux_qemu_start_vm || exit 1
     fi
 
     linux_qemu_wait_for_guest
+    linux_qemu_ensure_guest_tools
 }
 
 linux_qemu_guest_exec_raw() {
@@ -488,7 +591,7 @@ linux_qemu_guest_exec_raw() {
         -o UserKnownHostsFile="${LINUX_QEMU_KNOWN_HOSTS}" \
         -i "${LINUX_QEMU_HOST_KEY}" \
         -p "${VM_SSH_PORT}" \
-        root@127.0.0.1 \
+        root@"${LINUX_QEMU_GUEST_HOST}" \
         "${remote_cmd% }"
 }
 
