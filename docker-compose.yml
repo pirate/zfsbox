@@ -1,0 +1,12 @@
+services:
+  zfsbox:
+    build: .
+    image: ghcr.io/pirate/zfsbox:latest
+    cap_add:
+      - SYS_ADMIN
+    ports:
+      - "127.0.0.1:12049:12049"
+    command: ["sleep", "infinity"]
+    working_dir: /data
+    volumes:
+      - ./data:/data

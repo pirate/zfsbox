@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STATE_DIR="${PROJECT_DIR}/state"
+STATE_DIR="${ZFSBOX_STATE_DIR:-${PROJECT_DIR}/state}"
 ENV_FILE="${PROJECT_DIR}/.env"
 SKIP_HOST_MOUNTS="${ZFSBOX_SKIP_HOST_MOUNTS:-0}"
 
@@ -21,6 +21,8 @@ log() {
 }
 
 host_os="$(uname -s)"
+mounts_available=1
+mounts_unavailable_reason=""
 
 if [[ "${host_os}" == "Linux" && -f "${PROJECT_DIR}/scripts/linux-qemu-common.sh" ]]; then
     # shellcheck disable=SC1091
@@ -39,6 +41,86 @@ case "${host_os}" in
         exit 1
         ;;
 esac
+
+inside_container() {
+    [[ -f /.dockerenv ]]
+}
+
+host_has_cap_sys_admin() {
+    local caps_hex
+
+    [[ "${host_os}" == "Linux" ]] || return 1
+    caps_hex="$(awk '/^CapEff:/ {print $2}' /proc/self/status 2>/dev/null || true)"
+    [[ -n "${caps_hex}" ]] || return 1
+    (( (16#${caps_hex}) & (1 << 21) ))
+}
+
+host_root_run() {
+    if [[ "${EUID}" -eq 0 ]]; then
+        "$@"
+        return
+    fi
+
+    sudo "$@"
+}
+
+mount_permission_error() {
+    local error_text="$1"
+
+    [[ "${error_text}" == *"permission denied"* ]] || \
+        [[ "${error_text}" == *"Operation not permitted"* ]] || \
+        [[ "${error_text}" == *"operation not permitted"* ]]
+}
+
+set_mounts_unavailable() {
+    local reason="$1"
+
+    mounts_available=0
+    mounts_unavailable_reason="${reason}"
+}
+
+print_mount_fallback_notice() {
+    local pool="$1"
+    local target="$2"
+
+    printf 'Pool created or updated and exposed via NFSv4 at 127.0.0.1:%s:/%s (%s).\n' "${VM_NFS_PORT}" "${pool}" "${target}" >&2
+
+    if inside_container; then
+        cat >&2 <<EOF
+Automatic mount at ${target} was skipped because this container cannot perform mounts (${mounts_unavailable_reason}).
+To use the export, either:
+
+Option A: Mount the NFS export in a context that has mount permission, then bind-mount it into containers.
+  \$ docker run -p 127.0.0.1:${VM_NFS_PORT}:${VM_NFS_PORT} <your-image-with-zfsbox> zfsbox-zpool create ${pool} ...
+  \$ sudo mkdir -p ${target}
+  \$ sudo mount -t nfs4 -o port=${VM_NFS_PORT},proto=tcp,vers=4 127.0.0.1:/${pool} ${target}
+  \$ docker run -v ${target}:${target} <any-image> ls ${target}
+
+  Or create a Docker NFS volume instead of a host bind mount:
+  \$ export NFS_SERVER=127.0.0.1
+  \$ export NFS_OPTS=port=${VM_NFS_PORT},proto=tcp,vers=4
+  \$ export NFS_SHARE=/${pool}
+  \$ export NFS_VOL_NAME=${pool}
+  \$ docker volume create \\
+      --driver local \\
+      --opt type=nfs \\
+      --opt o=addr=\${NFS_SERVER},\${NFS_OPTS} \\
+      --opt device=:\${NFS_SHARE} \\
+      \${NFS_VOL_NAME}
+
+Option B: Re-run this container with CAP_SYS_ADMIN so zfsbox can auto-mount ${target} inside the container.
+  \$ docker run --cap-add SYS_ADMIN <your-image-with-zfsbox> zfsbox-zpool create ${pool} ...
+EOF
+        return
+    fi
+
+    cat >&2 <<EOF
+Automatic mount at ${target} was skipped because this environment cannot perform mounts (${mounts_unavailable_reason}).
+To mount it in a context that has mount permission, run:
+  \$ sudo mkdir -p ${target}
+  \$ sudo mount -t nfs4 -o port=${VM_NFS_PORT},proto=tcp,vers=4 127.0.0.1:/${pool} ${target}
+EOF
+}
 
 guest_exec() {
     local script="$1"
@@ -199,11 +281,7 @@ get_host_client_ip() {
 ensure_mount_target() {
     local target="$1"
 
-    if [[ "${host_os}" == "Darwin" ]]; then
-        sudo mkdir -p "${target}"
-    else
-        sudo mkdir -p "${target}"
-    fi
+    host_root_run mkdir -p "${target}"
 }
 
 is_mounted_at() {
@@ -221,8 +299,20 @@ ensure_host_mount_privileges() {
         return
     fi
 
+    if [[ "${host_os}" == "Linux" && "${EUID}" -eq 0 ]]; then
+        if ! host_has_cap_sys_admin; then
+            set_mounts_unavailable "CAP_SYS_ADMIN is not available"
+        fi
+        return
+    fi
+
     log "authorizing host mounts under ${host_os}"
-    sudo -v
+
+    if ! sudo -n true 2>/dev/null; then
+        if ! sudo -v; then
+            set_mounts_unavailable "mount permission is not available"
+        fi
+    fi
 }
 
 wait_for_nfs() {
@@ -242,6 +332,8 @@ mount_pool() {
     local target
     local source
     local current_source
+    local mount_stderr_file
+    local mount_error_text
 
     if [[ "${host_os}" == "Darwin" ]]; then
         target="/Volumes/${pool}"
@@ -261,11 +353,11 @@ mount_pool() {
             if [[ "${current_source}" == "${source}" ]]; then
                 return
             fi
-            sudo umount "${target}"
+            host_root_run umount "${target}"
             ensure_mount_target "${target}"
         fi
 
-        sudo /sbin/mount_nfs -o vers=3,tcp,nolocks "${source}" "${target}"
+        host_root_run /sbin/mount_nfs -o vers=3,tcp,nolocks "${source}" "${target}"
     else
         target="/mnt/${pool}"
         source="127.0.0.1:/${pool}"
@@ -281,21 +373,35 @@ mount_pool() {
             echo "Guest NFS server at 127.0.0.1:${VM_NFS_PORT} is not reachable from the Linux host." >&2
             exit 1
         fi
-        sudo mkdir -p "${target}"
+        host_root_run mkdir -p "${target}"
 
         if is_mounted_at "${target}"; then
             current_source="$(current_mount_source "${target}")"
             if [[ "${current_source}" == "${source}" ]]; then
                 return
             fi
-            sudo umount "${target}" || true
-            sudo mkdir -p "${target}"
+            host_root_run umount "${target}" || true
+            host_root_run mkdir -p "${target}"
         fi
 
-        sudo mount -t nfs4 \
+        mount_stderr_file="$(mktemp)"
+        if ! host_root_run mount -t nfs4 \
             -o "port=${VM_NFS_PORT},proto=tcp,vers=4" \
             "${source}" \
-            "${target}"
+            "${target}" 2>"${mount_stderr_file}"; then
+            mount_error_text="$(cat "${mount_stderr_file}")"
+            rm -f "${mount_stderr_file}"
+
+            if mount_permission_error "${mount_error_text}"; then
+                set_mounts_unavailable "CAP_SYS_ADMIN is not available"
+                print_mount_fallback_notice "${pool}" "${target}"
+                return 0
+            fi
+
+            printf '%s\n' "${mount_error_text}" >&2
+            return 1
+        fi
+        rm -f "${mount_stderr_file}"
     fi
 }
 
@@ -315,15 +421,11 @@ unmount_pool_if_managed() {
     fi
 
     if is_mounted_at "${target}"; then
-        if [[ "${host_os}" == "Darwin" ]]; then
-            sudo umount "${target}" || true
-        else
-            sudo umount "${target}" || true
-        fi
+        host_root_run umount "${target}" || true
     fi
 
     if [[ -d "${target}" ]]; then
-        sudo rmdir "${target}" 2>/dev/null || true
+        host_root_run rmdir "${target}" 2>/dev/null || true
     fi
 }
 
@@ -379,14 +481,24 @@ while IFS=$'\t' read -r pool mountpoint mounted; do
     fi
 
     printf '%s\n' "${pool}" >> "${desired_pools_file}"
-    mount_pool "${guest_ip}" "${mountpoint}" "${pool}"
+    if [[ "${mounts_available}" -eq 1 ]]; then
+        mount_pool "${guest_ip}" "${mountpoint}" "${pool}"
+    else
+        if [[ "${host_os}" == "Darwin" ]]; then
+            print_mount_fallback_notice "${pool}" "/Volumes/${pool}"
+        else
+            print_mount_fallback_notice "${pool}" "/mnt/${pool}"
+        fi
+    fi
 done <<< "${pool_lines}"
 
-while IFS= read -r pool; do
-    [[ -n "${pool}" ]] || continue
-    if ! grep -Fxq "${pool}" "${desired_pools_file}"; then
-        unmount_pool_if_managed "${pool}"
-    fi
-done < "${previous_pools_file}"
+if [[ "${mounts_available}" -eq 1 ]]; then
+    while IFS= read -r pool; do
+        [[ -n "${pool}" ]] || continue
+        if ! grep -Fxq "${pool}" "${desired_pools_file}"; then
+            unmount_pool_if_managed "${pool}"
+        fi
+    done < "${previous_pools_file}"
+fi
 
 sort -u "${desired_pools_file}" > "${managed_state_file}"

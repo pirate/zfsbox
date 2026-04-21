@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: zfsbox-mount <host:port> <pool> <target>
+
+Examples:
+  zfsbox-mount 127.0.0.1:12049 test2 ./mnt/test2
+EOF
+    exit 1
+}
+
+host_root_run() {
+    if [[ "${EUID}" -eq 0 ]]; then
+        "$@"
+        return
+    fi
+
+    sudo "$@"
+}
+
+if [[ $# -ne 3 ]]; then
+    usage
+fi
+
+endpoint="$1"
+pool="$2"
+target="$3"
+
+if [[ "${endpoint}" != *:* ]]; then
+    echo "Endpoint must be in host:port form; got: ${endpoint}" >&2
+    exit 1
+fi
+
+host="${endpoint%:*}"
+port="${endpoint##*:}"
+
+if [[ -z "${host}" || -z "${port}" || ! "${port}" =~ ^[0-9]+$ ]]; then
+    echo "Endpoint must be in host:port form; got: ${endpoint}" >&2
+    exit 1
+fi
+
+mkdir -p "${target}"
+
+case "$(uname -s)" in
+    Darwin)
+        host_root_run /sbin/mount_nfs -o "vers=4,tcp,port=${port}" "${host}:/${pool}" "${target}"
+        ;;
+    Linux)
+        host_root_run mount -t nfs4 -o "port=${port},proto=tcp,vers=4" "${host}:/${pool}" "${target}"
+        ;;
+    *)
+        echo "Unsupported host OS: $(uname -s)" >&2
+        exit 1
+        ;;
+esac

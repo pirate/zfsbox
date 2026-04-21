@@ -30,23 +30,57 @@ The current sweet spot is:
 ### macOS
 
 ```text
-macOS
-  -> Lima (vmType: vz, virtiofs, vzNAT)
-    -> Ubuntu guest
-      -> OpenZFS
-        -> NFS export back to macOS
-          -> /Volumes/<pool>
+macOS `./bin/zfsbox-zpool`       (does not need to have ZFS installed)
+  -> Lima Linux VM (vmType: vz, virtiofs, vzNAT)
+    -> OpenZFS kernel module
+    -> NFSv4 server to allow mounting /Volumes/<pool> on macOS host
 ```
+
+*See below for Docker usage.*
 
 ### Linux
 
 ```text
-Linux
-  -> QEMU (rootless, /dev/kvm when available)
-    -> Ubuntu guest
-      -> OpenZFS
-        -> NFSv4 back to /mnt/<pool>
+Linux `./bin/zfsbox-zpool`       (does not need to have ZFS installed)
+  -> QEMU Linux VM (rootless, /dev/kvm when available)
+    -> OpenZFS kernel module
+    -> NFSv4 server to allow mounting /mnt/<pool> on Linux host
 ```
+
+### Docker
+
+```text
+Host OS                (does not need to have ZFS installed)
+  -> Docker zfsbox container
+    -> QEMU/KVM VM     (runs ZFS kernel module inside VM)
+      -> OpenZFS kernel module
+      -> NFSv4 server to allow mounting /mnt/<pool> inside/outside Docker
+```
+
+Use the provided [`docker-compose.yml`](./docker-compose.yml) directly.
+
+```bash
+mkdir -p data mnt
+truncate -s 10G ./data/test2.zpool
+docker compose run --rm zfsbox zpool create test2 /data/test2.zpool
+docker compose run --rm zfsbox sh -lc 'echo test > /mnt/test2/test.txt'
+docker compose run --rm zfsbox cat /mnt/test2/test.txt
+docker compose run --rm zfsbox zfs set snapdir=visible test2
+docker compose run --rm zfsbox zfs snapshot test2@latest
+docker compose run --rm zfsbox cat /mnt/test2/.zfs/snapshot/latest/test.txt
+
+# Or keep the server up and mount the same pool on the outer host.
+docker compose up -d
+./bin/zfsbox-mount 127.0.0.1:12049 test2 ./mnt/test2
+cat ./mnt/test2/test.txt
+cat ./mnt/test2/.zfs/snapshot/latest/test.txt
+```
+
+Notes:
+
+- VM runtime state is stored automatically under `./data/.zfsbox/state`, so separate `docker compose run ...` and `docker compose up ...` invocations reuse the same known pools and datasets.
+- `./bin/zfsbox-mount` mounts the exported NFS path on the outer host using the right macOS/Linux mount command for that host.
+- Use <https://www.composerize.com/> if you prefer `docker run ...` instead of `docker compose ...`.
 
 ## 🚀 Quick Start
 
@@ -74,14 +108,20 @@ Both are optional. `LIMA_VM_RECREATE=true` forces the next run to rebuild the Li
 truncate -s 10G ~/Desktop/testpool.zpool
 ```
 
+(only needed if you want to use a file for the pool backing store instead of a `/dev/disk`)
+
 ### 3. Create a pool
 
 ```bash
-zpool create test ~/Desktop/testpool.zpool
+zpool create test ~/Desktop/testpool.zpool   # using a file to store the pool data
+
+# or
+
+zpool create test /dev/disk8 ...             # using real disk(s) for the pool vdevs
 ```
 
-On macOS, the first mutating command may ask for Touch ID because `zfsbox` mounts pool roots under `/Volumes`.
-On Linux, `zfsbox` keeps the VM itself rootless and only uses `sudo` when it needs to prepare `/mnt/<pool>`.
+On macOS and linux, first run may request `sudo` permissions. 
+Root permissions are only used to mount the pools/datasets under `/Volumes` or `/mnt`, you can run `zfsbox` `zpool`/`zfs` commands fully rootless if you don't need to mount anything.
 
 ### 4. Use it from the host
 
@@ -196,7 +236,7 @@ zfs list
 - Host-visible pool mounts are implemented with **guest-side NFS** on macOS and **guest-side NFSv4 over localhost port forwarding** on Linux.
 - macOS host mountpoints under `/Volumes/<pool>` may require re-auth with Touch ID when reconciling mounts.
 - On Linux, `/dev/kvm` is optional for acceleration but not required for correctness; `/mnt/<pool>` preparation is the only step that needs `sudo`.
-- The current Linux runner is implemented for `x86_64` hosts first and expects `qemu-system-x86_64`, `qemu-img`, one cloud-init seed-image builder, and host NFS client tools.
+- The current Linux runner expects QEMU system emulation, `qemu-img`, one cloud-init seed-image builder, and host NFS client tools.
 
 ## 📚 References
 

@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "${SCRIPT_PATH}" ]]; do
+    SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+    SCRIPT_LINK="$(readlink "${SCRIPT_PATH}")"
+    if [[ "${SCRIPT_LINK}" != /* ]]; then
+        SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_LINK}"
+    else
+        SCRIPT_PATH="${SCRIPT_LINK}"
+    fi
+done
+
+BIN_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
 PROJECT_DIR="$(cd "${BIN_DIR}/.." && pwd)"
 
 needs_sync=0
