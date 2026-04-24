@@ -23,6 +23,8 @@ VM_MEMORY_MB="${VM_MEMORY_MB:-2048}"
 VM_VCPUS="${VM_VCPUS:-2}"
 LIMA_VM_RECREATE="${LIMA_VM_RECREATE:-false}"
 LIMA_VM_MOUNTS="${LIMA_VM_MOUNTS:-}"
+LIMA_REPO_DIR="${LIMA_REPO_DIR:-${HOME}/Local/Code/lima}"
+LIMACTL_BIN="${LIMACTL_BIN:-}"
 
 mkdir -p "${STATE_DIR}"
 
@@ -62,6 +64,61 @@ log() {
     printf 'zfsbox: %s\n' "$*" >&2
 }
 
+resolve_limactl() {
+    local repo_limactl repo_default_template repo_guestagent
+
+    repo_limactl="${LIMA_REPO_DIR}/_output/bin/limactl"
+    repo_default_template="${LIMA_REPO_DIR}/_output/share/lima/templates/default.yaml"
+    case "$(uname -m)" in
+        arm64|aarch64)
+            repo_guestagent="${LIMA_REPO_DIR}/_output/share/lima/lima-guestagent.Linux-aarch64.gz"
+            ;;
+        x86_64)
+            repo_guestagent="${LIMA_REPO_DIR}/_output/share/lima/lima-guestagent.Linux-x86_64.gz"
+            ;;
+        *)
+            repo_guestagent=""
+            ;;
+    esac
+
+    if [[ -n "${LIMACTL_BIN}" ]]; then
+        if [[ ! -x "${LIMACTL_BIN}" ]]; then
+            echo "Configured LIMACTL_BIN is not executable: ${LIMACTL_BIN}" >&2
+            exit 1
+        fi
+        LIMACTL_CMD="${LIMACTL_BIN}"
+        return
+    fi
+
+    if [[ -x "${repo_limactl}" && -f "${repo_default_template}" && ( -z "${repo_guestagent}" || -f "${repo_guestagent}" ) ]]; then
+        LIMACTL_CMD="${repo_limactl}"
+        return
+    fi
+
+    if [[ -d "${LIMA_REPO_DIR}" && -f "${LIMA_REPO_DIR}/Makefile" && -d "${LIMA_REPO_DIR}/cmd/limactl" ]]; then
+        if ! command -v make >/dev/null 2>&1 || ! command -v go >/dev/null 2>&1; then
+            echo "Building limactl from ${LIMA_REPO_DIR} requires both make and go." >&2
+            exit 1
+        fi
+        log "building limactl, templates, and guestagent from local repo ${LIMA_REPO_DIR}"
+        make -C "${LIMA_REPO_DIR}" _output/bin/limactl templates native-guestagent >/dev/null
+        LIMACTL_CMD="${repo_limactl}"
+        return
+    fi
+
+    if command -v limactl >/dev/null 2>&1; then
+        LIMACTL_CMD="$(command -v limactl)"
+        return
+    fi
+
+    echo "limactl is required on macOS. Set LIMACTL_BIN or provide a local Lima repo at ${LIMA_REPO_DIR}." >&2
+    exit 1
+}
+
+run_limactl() {
+    "${LIMACTL_CMD}" "$@"
+}
+
 json_escape() {
     local value="$1"
 
@@ -87,51 +144,45 @@ load_mount_configuration() {
         raw_mounts="$(default_lima_vm_mounts_json)"
     fi
 
-    parsed="$(LIMA_VM_MOUNTS_RAW="${raw_mounts}" osascript -l JavaScript 2>&1 <<'EOF'
-ObjC.import('Foundation');
-ObjC.import('stdlib');
+    parsed="$(LIMA_VM_MOUNTS_RAW="${raw_mounts}" python3 - <<'EOF'
+import json
+import os
+import sys
 
-const env = $.NSProcessInfo.processInfo.environment;
-const raw = ObjC.unwrap(env.objectForKey('LIMA_VM_MOUNTS_RAW'));
+raw = os.environ["LIMA_VM_MOUNTS_RAW"]
 
-try {
-  const mounts = JSON.parse(raw);
-  if (!Array.isArray(mounts)) {
-    throw new Error("LIMA_VM_MOUNTS must be a JSON array of Lima mount objects");
-  }
+try:
+    mounts = json.loads(raw)
+    if not isinstance(mounts, list):
+        raise ValueError("LIMA_VM_MOUNTS must be a JSON array of Lima mount objects")
 
-  const normalized = [];
-  for (let i = 0; i < mounts.length; i += 1) {
-    const mount = mounts[i];
-    if (mount === null || Array.isArray(mount) || typeof mount !== "object") {
-      throw new Error(`LIMA_VM_MOUNTS[${i}] must be an object`);
-    }
-    if (typeof mount.location !== "string" || !mount.location.startsWith("/")) {
-      throw new Error(`LIMA_VM_MOUNTS[${i}].location must be an absolute host path`);
-    }
-    const nextMount = { ...mount };
-    if (!Object.prototype.hasOwnProperty.call(nextMount, "mountPoint")) {
-      nextMount.mountPoint = nextMount.location;
-    } else {
-      if (typeof nextMount.mountPoint !== "string" || !nextMount.mountPoint.startsWith("/")) {
-        throw new Error(`LIMA_VM_MOUNTS[${i}].mountPoint must be an absolute guest path`);
-      }
-      if (nextMount.mountPoint !== nextMount.location) {
-        throw new Error(`LIMA_VM_MOUNTS[${i}].mountPoint must match location so host paths stay valid inside zfsbox`);
-      }
-    }
+    normalized = []
+    for i, mount in enumerate(mounts):
+        if not isinstance(mount, dict):
+            raise ValueError(f"LIMA_VM_MOUNTS[{i}] must be an object")
 
-    normalized.push(nextMount);
-  }
+        location = mount.get("location")
+        if not isinstance(location, str) or not location.startswith("/"):
+            raise ValueError(f"LIMA_VM_MOUNTS[{i}].location must be an absolute host path")
 
-  console.log(JSON.stringify(normalized));
-  for (const mount of normalized) {
-    console.log(mount.location);
-  }
-} catch (error) {
-  console.error(String(error.message || error));
-  $.exit(1);
-}
+        next_mount = dict(mount)
+        mount_point = next_mount.get("mountPoint", location)
+        if not isinstance(mount_point, str) or not mount_point.startswith("/"):
+            raise ValueError(f"LIMA_VM_MOUNTS[{i}].mountPoint must be an absolute guest path")
+        if mount_point != location:
+            raise ValueError(
+                f"LIMA_VM_MOUNTS[{i}].mountPoint must match location so host paths stay valid inside zfsbox"
+            )
+
+        next_mount["mountPoint"] = mount_point
+        normalized.append(next_mount)
+
+    print(json.dumps(normalized, separators=(",", ":")))
+    for mount in normalized:
+        print(mount["location"])
+except Exception as exc:  # noqa: BLE001
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)
 EOF
 )" || exit 1
 
@@ -151,10 +202,14 @@ EOF
     done <<< "${parsed}"
 }
 
-if ! command -v limactl >/dev/null 2>&1; then
-    echo "limactl is required on macOS. Install Lima first: brew install lima" >&2
-    exit 1
-fi
+build_lima_mount_flags() {
+    LIMA_MOUNT_FLAGS=(--mount-writable)
+    local visible_root
+
+    for visible_root in "${LIMA_ALLOWED_PATHS[@]}"; do
+        LIMA_MOUNT_FLAGS+=(--mount-only "${visible_root}")
+    done
+}
 
 if [[ $# -eq 0 ]]; then
     echo "Usage: $(basename "$0") <command> [args...]" >&2
@@ -218,7 +273,6 @@ write_lima_marker() {
 
 apply_instance_config_if_needed() {
     local needs_resource_update=0
-    local needs_mount_update=0
     local edit_args=()
 
     if instance_needs_resource_update; then
@@ -230,66 +284,61 @@ apply_instance_config_if_needed() {
     fi
 
     if instance_needs_mount_update; then
-        needs_mount_update=1
-        edit_args+=(
-            --set
-            ".mounts = ${LIMA_VM_MOUNTS_JSON}"
-        )
+        log "recreating Lima instance ${INSTANCE_NAME} because mount configuration changed"
+        run_limactl "${LIMA_ARGS[@]}" delete -f "${INSTANCE_NAME}" >/dev/null 2>&1 || true
+        rm -f "${LIMA_MARKER_FILE}"
+        ensure_instance
+        return
     fi
 
     if [[ "${#edit_args[@]}" -eq 0 ]]; then
         return
     fi
 
-    if [[ "${needs_resource_update}" -eq 1 && "${needs_mount_update}" -eq 1 ]]; then
-        log "updating Lima instance ${INSTANCE_NAME} resources and mounts"
-    elif [[ "${needs_resource_update}" -eq 1 ]]; then
+    if [[ "${needs_resource_update}" -eq 1 ]]; then
         log "updating Lima instance ${INSTANCE_NAME} resources (cpus=${VM_VCPUS}, memory=${VM_MEMORY_MB}MiB)"
-    else
-        log "updating Lima instance ${INSTANCE_NAME} mounts"
     fi
 
-    limactl "${LIMA_ARGS[@]}" stop "${INSTANCE_NAME}" >/dev/null 2>&1 || true
-    limactl "${LIMA_ARGS[@]}" edit "${edit_args[@]}" "${INSTANCE_NAME}" >/dev/null
+    run_limactl "${LIMA_ARGS[@]}" stop "${INSTANCE_NAME}" >/dev/null 2>&1 || true
+    run_limactl "${LIMA_ARGS[@]}" edit "${edit_args[@]}" "${INSTANCE_NAME}" >/dev/null
     write_lima_marker
 }
 
 ensure_instance() {
     if [[ "${LIMA_VM_RECREATE}" == "true" ]]; then
         log "recreating Lima instance ${INSTANCE_NAME} because LIMA_VM_RECREATE=true"
-        limactl "${LIMA_ARGS[@]}" delete -f "${INSTANCE_NAME}" >/dev/null 2>&1 || true
+        run_limactl "${LIMA_ARGS[@]}" delete -f "${INSTANCE_NAME}" >/dev/null 2>&1 || true
         rm -f "${LIMA_MARKER_FILE}"
     elif [[ -f "${LIMA_CONFIG_FILE}" ]] && ! grep -Eq '^[[:space:]]*-[[:space:]]*vzNAT:[[:space:]]*true[[:space:]]*$' "${LIMA_CONFIG_FILE}"; then
         log "recreating Lima instance ${INSTANCE_NAME} with host-reachable vzNAT networking"
-        limactl "${LIMA_ARGS[@]}" delete -f "${INSTANCE_NAME}" >/dev/null 2>&1 || true
+        run_limactl "${LIMA_ARGS[@]}" delete -f "${INSTANCE_NAME}" >/dev/null 2>&1 || true
         rm -f "${LIMA_MARKER_FILE}"
     fi
 
-    if limactl list 2>/dev/null | awk 'NR > 1 { print $1 }' | grep -qx "${INSTANCE_NAME}"; then
+    if run_limactl list 2>/dev/null | awk 'NR > 1 { print $1 }' | grep -qx "${INSTANCE_NAME}"; then
         apply_instance_config_if_needed
         log "starting Lima instance ${INSTANCE_NAME}"
-        limactl "${LIMA_ARGS[@]}" start "${INSTANCE_NAME}" >/dev/null 2>&1 || true
+        run_limactl "${LIMA_ARGS[@]}" start "${INSTANCE_NAME}" >/dev/null 2>&1 || true
         return
     fi
 
     log "creating Lima instance ${INSTANCE_NAME}"
-    limactl "${LIMA_ARGS[@]}" start \
+    run_limactl "${LIMA_ARGS[@]}" start \
         --name="${INSTANCE_NAME}" \
         --vm-type=vz \
         --network=vzNAT \
         --containerd=none \
         --mount-type=virtiofs \
-        --mount-writable \
         --cpus="${VM_VCPUS}" \
         --memory="${LIMA_MEMORY_GIB}" \
-        --set ".mounts = ${LIMA_VM_MOUNTS_JSON}" \
+        "${LIMA_MOUNT_FLAGS[@]}" \
         template:default >/dev/null
     write_lima_marker
 }
 
 ensure_zfs() {
     log "ensuring ZFS tooling is installed in the Lima guest"
-    limactl "${LIMA_ARGS[@]}" shell "${INSTANCE_NAME}" bash -lc '
+    run_limactl "${LIMA_ARGS[@]}" shell "${INSTANCE_NAME}" bash -lc '
 set -Eeuo pipefail
 
 if ! command -v zpool >/dev/null 2>&1; then
@@ -306,9 +355,11 @@ sudo modprobe zfs >/dev/null 2>&1 || true
 ' >/dev/null
 }
 
+resolve_limactl
 load_mount_configuration
+build_lima_mount_flags
 validate_visible_paths "$@"
 ensure_instance
 ensure_zfs
 
-exec limactl "${LIMA_ARGS[@]}" shell "${INSTANCE_NAME}" sudo "$@"
+exec "${LIMACTL_CMD}" "${LIMA_ARGS[@]}" shell "${INSTANCE_NAME}" sudo "$@"
