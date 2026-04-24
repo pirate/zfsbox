@@ -1,0 +1,27 @@
+README.md
+  14c0027ba26bb661 84,102-109,334-335,352
+.github/workflows/publish-image.yml
+  14c0027ba26bb661 20-22,49-50
+docker-compose.yml
+  14c0027ba26bb661 3-4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "d5e116aba4138fd0da33f24ef8924471a7ba4690",
+  "prompts": {
+    "14c0027ba26bb661": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d61e7-bb4b-7c01-b983-cb15ee81f3ca",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Nick Sweeting",
+      "messages": [],
+      "total_additions": 19,
+      "total_deletions": 5,
+      "accepted_lines": 19,
+      "overriden_lines": 0
+    }
+  }
+}
