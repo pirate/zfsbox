@@ -368,6 +368,10 @@ If you publish `127.0.0.1:12049:12049`, the outer host can mount the same pool t
 - [QEMU invocation docs](https://www.qemu.org/docs/master/system/invocation.html)
 - [OpenZFS documentation](https://openzfs.github.io/openzfs-docs/)
 - [ZFS `snapdir` property](https://openzfs.github.io/openzfs-docs/man/master/7/zfsprops.7.html)
+- https://docs.zfsbootmenu.org/en/v3.1.x/
+- https://github.com/whoschek/bzfs
+- https://github.com/jonmatifa/zfsmanager
+- https://github.com/pirate/zfs.wizard
 
 ## 🗺 Roadmap
 
