@@ -23,8 +23,6 @@ VM_MEMORY_MB="${VM_MEMORY_MB:-2048}"
 VM_VCPUS="${VM_VCPUS:-2}"
 LIMA_VM_RECREATE="${LIMA_VM_RECREATE:-false}"
 LIMA_VM_MOUNTS="${LIMA_VM_MOUNTS:-}"
-LIMA_REPO_DIR="${LIMA_REPO_DIR:-${HOME}/Local/Code/lima}"
-LIMACTL_BIN="${LIMACTL_BIN:-}"
 
 mkdir -p "${STATE_DIR}"
 
@@ -65,53 +63,12 @@ log() {
 }
 
 resolve_limactl() {
-    local repo_limactl repo_default_template repo_guestagent
-
-    repo_limactl="${LIMA_REPO_DIR}/_output/bin/limactl"
-    repo_default_template="${LIMA_REPO_DIR}/_output/share/lima/templates/default.yaml"
-    case "$(uname -m)" in
-        arm64|aarch64)
-            repo_guestagent="${LIMA_REPO_DIR}/_output/share/lima/lima-guestagent.Linux-aarch64.gz"
-            ;;
-        x86_64)
-            repo_guestagent="${LIMA_REPO_DIR}/_output/share/lima/lima-guestagent.Linux-x86_64.gz"
-            ;;
-        *)
-            repo_guestagent=""
-            ;;
-    esac
-
-    if [[ -n "${LIMACTL_BIN}" ]]; then
-        if [[ ! -x "${LIMACTL_BIN}" ]]; then
-            echo "Configured LIMACTL_BIN is not executable: ${LIMACTL_BIN}" >&2
-            exit 1
-        fi
-        LIMACTL_CMD="${LIMACTL_BIN}"
-        return
-    fi
-
-    if [[ -x "${repo_limactl}" && -f "${repo_default_template}" && ( -z "${repo_guestagent}" || -f "${repo_guestagent}" ) ]]; then
-        LIMACTL_CMD="${repo_limactl}"
-        return
-    fi
-
-    if [[ -d "${LIMA_REPO_DIR}" && -f "${LIMA_REPO_DIR}/Makefile" && -d "${LIMA_REPO_DIR}/cmd/limactl" ]]; then
-        if ! command -v make >/dev/null 2>&1 || ! command -v go >/dev/null 2>&1; then
-            echo "Building limactl from ${LIMA_REPO_DIR} requires both make and go." >&2
-            exit 1
-        fi
-        log "building limactl, templates, and guestagent from local repo ${LIMA_REPO_DIR}"
-        make -C "${LIMA_REPO_DIR}" _output/bin/limactl templates native-guestagent >/dev/null
-        LIMACTL_CMD="${repo_limactl}"
-        return
-    fi
-
     if command -v limactl >/dev/null 2>&1; then
         LIMACTL_CMD="$(command -v limactl)"
         return
     fi
 
-    echo "limactl is required on macOS. Set LIMACTL_BIN or provide a local Lima repo at ${LIMA_REPO_DIR}." >&2
+    echo "limactl is required on macOS and must be available in PATH." >&2
     exit 1
 }
 
