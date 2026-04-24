@@ -1,0 +1,23 @@
+scripts/macos-lima-zfs-exec.sh
+  14c0027ba26bb661 71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "a70c981ba4ebf4efbdb05bcc656f2550c2317430",
+  "prompts": {
+    "14c0027ba26bb661": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d61e7-bb4b-7c01-b983-cb15ee81f3ca",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Nick Sweeting",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 44,
+      "accepted_lines": 1,
+      "overriden_lines": 0
+    }
+  }
+}
