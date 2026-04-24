@@ -81,6 +81,7 @@ Basic usage:
 mkdir -p data mnt
 truncate -s 10G ./data/test2.zpool
 
+docker compose up -d
 docker compose exec zfsbox zpool create test2 /data/test2.zpool
 docker compose exec zfsbox sh -lc 'echo test > /mnt/test2/test.txt'
 docker compose exec zfsbox cat /mnt/test2/test.txt
@@ -97,6 +98,14 @@ cat ./mnt/test2/.zfs/snapshot/latest/test.txt
 ```
 
 Notes:
+
+- The checked-in compose file now pulls the published multi-arch GHCR image by default instead of building locally. That makes first run much faster for normal users on both `linux/amd64` and `linux/arm64`.
+- If you are developing `zfsbox` itself locally, build your own image first and point compose at it:
+
+```bash
+docker build -t ghcr.io/pirate/zfsbox:dev .
+ZFSBOX_IMAGE=ghcr.io/pirate/zfsbox:dev docker compose up -d
+```
 
 - Runtime state is stored automatically under `./data/.zfsbox/state`, so separate `docker compose run ...` and `docker compose up ...` invocations reuse the same known pools and datasets.
 - Use <https://www.composerize.com/> if you prefer `docker run ...` instead of `docker compose ...`.
@@ -322,8 +331,8 @@ The tradeoff is that Docker mode is convenient and self-contained, but it adds a
 
 - CLI flags: none. Use normal `docker compose ...` or `docker run ...` arguments around the container.
 - Compose options in the checked-in `docker-compose.yml`:
-  - `build: .`
-  - `image: ghcr.io/pirate/zfsbox:latest`
+  - `image: ${ZFSBOX_IMAGE:-ghcr.io/pirate/zfsbox:latest}`
+  - `pull_policy: missing`
   - `cap_add: [SYS_ADMIN]`
   - `ports: ["127.0.0.1:12049:12049"]`
   - `command: ["sleep", "infinity"]`
@@ -340,7 +349,7 @@ The tradeoff is that Docker mode is convenient and self-contained, but it adds a
 
 The main performance knobs are still `VM_MEMORY_MB` and `VM_VCPUS`. Keeping `./data` on fast local storage helps because it holds both pool backing files and the persistent runtime state under `./data/.zfsbox/state`. On Linux hosts, adding `/dev/kvm` is the big acceleration switch. On Docker Desktop and similar environments without KVM passthrough, expect slower first boot because the guest is fully emulated and still has to provision its own packages on first run.
 
-`docker compose run --rm ...` and `docker compose up ...` reuse the same persisted state as long as `./data` is the same bind mount, so repeated runs avoid reprovisioning once the runtime is warm.
+The published container image is built for both `linux/amd64` and `linux/arm64` with Docker Buildx and pushed to GHCR from GitHub Actions, so normal Docker users do not need to build locally before first use. `docker compose run --rm ...` and `docker compose up ...` still reuse the same persisted state as long as `./data` is the same bind mount, so repeated runs avoid reprovisioning once the runtime is warm.
 
 **When root is used**
 

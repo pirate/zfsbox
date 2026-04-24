@@ -1,7 +1,7 @@
 services:
   zfsbox:
-    build: .
-    image: ghcr.io/pirate/zfsbox:latest
+    image: "${ZFSBOX_IMAGE:-ghcr.io/pirate/zfsbox:latest}"
+    pull_policy: missing
     environment:
       VM_SSH_PORT: "${VM_SSH_PORT:-12022}"
       VM_NFS_PORT: "${VM_NFS_PORT:-12049}"
