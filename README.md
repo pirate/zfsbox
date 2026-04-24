@@ -1,4 +1,4 @@
-# 🗄️ `zfsbox`<br/> Run ZFS from userspace on macOS/Linux<br/><small>(without needing to install ZFS kernel modules on the host)</small>
+# 🗄️ `zfsbox`<br/> Run ZFS from userspace on macOS/Linux<br/><small>(without needing to install ZFS kernel modules / FUSE)</small>
 
 > Magic `zpool` and `zfs` wrappers that make ZFS "just work" macOS, Linux, and Docker *without* needing the ZFS kernel module installed.
 
