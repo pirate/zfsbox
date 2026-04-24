@@ -1,0 +1,23 @@
+.github/workflows/publish-image.yml
+  14c0027ba26bb661 9-11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "8955c97f77710bff16d16507cceb50515520d6da",
+  "prompts": {
+    "14c0027ba26bb661": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d61e7-bb4b-7c01-b983-cb15ee81f3ca",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Nick Sweeting",
+      "messages": [],
+      "total_additions": 417,
+      "total_deletions": 0,
+      "accepted_lines": 417,
+      "overriden_lines": 0
+    }
+  }
+}
