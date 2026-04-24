@@ -1,0 +1,23 @@
+scripts/build-seeded-linux-qemu-image.sh
+  14c0027ba26bb661 1-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "43dfbc24d9c80f9a95669c8771117d765d1c161b",
+  "prompts": {
+    "14c0027ba26bb661": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019d61e7-bb4b-7c01-b983-cb15ee81f3ca",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Nick Sweeting",
+      "messages": [],
+      "total_additions": 327,
+      "total_deletions": 93,
+      "accepted_lines": 447,
+      "overriden_lines": 12
+    }
+  }
+}
