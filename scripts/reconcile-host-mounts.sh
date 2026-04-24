@@ -128,7 +128,8 @@ guest_exec() {
     if [[ "${host_os}" == "Darwin" ]]; then
         limactl --log-level=error -y shell "${LIMA_INSTANCE_NAME}" bash -lc "${script}"
     else
-        linux_qemu_guest_exec bash -lc "${script}"
+        LINUX_QEMU_SSH_TIMEOUT_SECONDS="${RECONCILE_GUEST_SSH_TIMEOUT_SECONDS:-30}" \
+            linux_qemu_guest_exec bash -lc "${script}"
     fi
 }
 
@@ -146,63 +147,6 @@ ensure_guest_exports() {
     local host_client_q="$1"
 
     if [[ "${host_os}" == "Linux" ]]; then
-        guest_sudo_exec "
-set -Eeuo pipefail
-
-if command -v apt-get >/dev/null 2>&1 && ! command -v exportfs >/dev/null 2>&1; then
-    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update >/dev/null 2>&1
-    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y nfs-kernel-server >/dev/null 2>&1
-fi
-
-mkdir -p /etc/exports.d /srv/zfsbox/exports
-tmp_exports=\$(mktemp)
-tmp_desired=\$(mktemp)
-
-printf '%s\\n' '/srv/zfsbox/exports *(rw,fsid=0,sync,no_subtree_check,no_root_squash,crossmnt,insecure)' > \"\${tmp_exports}\"
-
-zfs list -H -o name,mountpoint,mounted -t filesystem -d 0 | while IFS=\$'\\t' read -r name mountpoint mounted; do
-    case \"\${mountpoint}\" in
-        legacy|none|-|'')
-            continue
-            ;;
-    esac
-
-    if [[ \"\${mounted}\" != yes ]]; then
-        continue
-    fi
-
-    target=\"/srv/zfsbox/exports/\${name}\"
-    mkdir -p \"\${target}\"
-
-    if mountpoint -q \"\${target}\"; then
-        current_source=\$(findmnt -n -o SOURCE --target \"\${target}\" 2>/dev/null || true)
-        if [[ \"\${current_source}\" != \"\${mountpoint}\" ]]; then
-            umount \"\${target}\" || true
-        fi
-    fi
-
-    if ! mountpoint -q \"\${target}\"; then
-        mount --bind \"\${mountpoint}\" \"\${target}\"
-    fi
-
-    printf '%s\\n' \"\${target}\" >> \"\${tmp_desired}\"
-    printf '%s\\n' \"\${target} *(rw,sync,no_subtree_check,no_root_squash,insecure)\" >> \"\${tmp_exports}\"
-done
-
-find /srv/zfsbox/exports -mindepth 1 -maxdepth 1 -type d | while IFS= read -r path; do
-    if ! grep -Fxq \"\${path}\" \"\${tmp_desired}\"; then
-        if mountpoint -q \"\${path}\"; then
-            umount \"\${path}\" || true
-        fi
-        rmdir \"\${path}\" 2>/dev/null || true
-    fi
-done
-
-mv \"\${tmp_exports}\" /etc/exports.d/zfsbox-hostmounts.exports
-rm -f \"\${tmp_desired}\"
-systemctl enable --now nfs-server >/dev/null 2>&1 || systemctl enable --now nfs-kernel-server >/dev/null 2>&1 || true
-exportfs -ra
-"
         return 0
     fi
 
@@ -243,6 +187,10 @@ ensure_guest_permissions() {
     local host_uid_q="$1"
     local host_gid_q="$2"
 
+    if [[ "${host_os}" == "Linux" ]]; then
+        return 0
+    fi
+
     guest_sudo_exec "
 set -Eeuo pipefail
 
@@ -267,6 +215,13 @@ done
 }
 
 list_root_pools() {
+    if [[ "${host_os}" == "Linux" ]]; then
+        printf -v host_uid_q '%q' "$(id -u)"
+        printf -v host_gid_q '%q' "$(id -g)"
+        guest_sudo_exec "/usr/local/sbin/zfsbox-sync-exports.sh ${host_uid_q} ${host_gid_q}"
+        return
+    fi
+
     guest_sudo_exec "zfs list -H -o name,mountpoint,mounted -t filesystem -d 0"
 }
 
@@ -317,12 +272,29 @@ ensure_host_mount_privileges() {
 
 wait_for_nfs() {
     local guest_ip="$1"
+    local port
+    local _try
 
     if [[ "${host_os}" == "Darwin" ]]; then
-        nc -G 2 -z "${guest_ip}" 2049 >/dev/null 2>&1
+        port=2049
     else
-        nc -w 2 -z "${guest_ip}" "${VM_NFS_PORT}" >/dev/null 2>&1
+        port="${VM_NFS_PORT}"
     fi
+
+    for _try in $(seq 1 30); do
+        if [[ "${host_os}" == "Darwin" ]]; then
+            if nc -G 2 -z "${guest_ip}" "${port}" >/dev/null 2>&1; then
+                return 0
+            fi
+        else
+            if nc -w 2 -z "${guest_ip}" "${port}" >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        sleep 0.2
+    done
+
+    return 1
 }
 
 mount_pool() {
@@ -385,8 +357,25 @@ mount_pool() {
         fi
 
         mount_stderr_file="$(mktemp)"
-        if ! host_root_run mount -t nfs4 \
-            -o "port=${VM_NFS_PORT},proto=tcp,vers=4" \
+        if command -v timeout >/dev/null 2>&1; then
+            if ! host_root_run timeout 15 mount -t nfs4 \
+                -o "port=${VM_NFS_PORT},proto=tcp,vers=4,soft,timeo=50,retrans=1" \
+                "${source}" \
+                "${target}" 2>"${mount_stderr_file}"; then
+                mount_error_text="$(cat "${mount_stderr_file}")"
+                rm -f "${mount_stderr_file}"
+
+                if mount_permission_error "${mount_error_text}"; then
+                    set_mounts_unavailable "CAP_SYS_ADMIN is not available"
+                    print_mount_fallback_notice "${pool}" "${target}"
+                    return 0
+                fi
+
+                printf '%s\n' "${mount_error_text}" >&2
+                return 1
+            fi
+        elif ! host_root_run mount -t nfs4 \
+            -o "port=${VM_NFS_PORT},proto=tcp,vers=4,soft,timeo=50,retrans=1" \
             "${source}" \
             "${target}" 2>"${mount_stderr_file}"; then
             mount_error_text="$(cat "${mount_stderr_file}")"

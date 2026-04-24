@@ -18,7 +18,7 @@ PROJECT_DIR="$(cd "${BIN_DIR}/.." && pwd)"
 needs_sync=0
 
 case "${1:-}" in
-    create|destroy|rename|clone|receive|recv|set|inherit|mount|unmount|umount|load-key|unload-key)
+    create|destroy|rename|clone|receive|recv|mount|unmount|umount|load-key|unload-key)
         needs_sync=1
         ;;
 esac

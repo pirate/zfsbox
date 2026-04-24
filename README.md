@@ -6,15 +6,13 @@
 
 It allows you to run ZFS on macOS, Linux, or in Docker containers without having to mess around with FUSE, `/dev/zfs`, `dkms`, or `privileged: true`.
 
-## What
-
 ## ✨ Features
 
 - Host-side `zpool` and `zfs` wrappers
 - macOS-backed pools using block devices or files under `${HOME}`, `/Volumes`, or `/dev`
 - Linux-backed pools using block devices or files anywhere under `/` or `/dev`.
 - automatic host mounts at `/Volumes/<pool>` on macOS
-- automatic host mounts at `/mnt/<pool>` on Linux
+- automatic mounts at `/mnt/<pool>` on Linux and inside the provided Docker service
 - fully working `zfs send`, `zfs recv`, `zfs snapshot` + `.zfs/snapshot` dirs on host mounts, and more
 - work inside Docker, Docker Compose, Docker Desktop, and Kubernetes as well (on Linux, macOS, and Windows hosts *without* needing ZFS installed in Docker VM)
 
@@ -23,7 +21,8 @@ It allows you to run ZFS on macOS, Linux, or in Docker containers without having
 ### 1. Load the `zpool` and `zfs` command aliases (optional)
 
 ```bash
-git clone https://github.com/pirate/zfsbox.git && zfsbox
+git clone https://github.com/pirate/zfsbox.git
+cd zfsbox
 
 source ./zfsbox.aliases.sh
 ```
@@ -81,17 +80,16 @@ Basic usage:
 mkdir -p data mnt
 truncate -s 10G ./data/test2.zpool
 
-docker compose up -d
-docker compose exec zfsbox zpool create test2 /data/test2.zpool
-docker compose exec zfsbox sh -lc 'echo test > /mnt/test2/test.txt'
-docker compose exec zfsbox cat /mnt/test2/test.txt
-docker compose exec zfsbox zfs set snapdir=visible test2
-docker compose exec zfsbox zfs snapshot test2@latest
-docker compose exec zfsbox ls /mnt/test2/.zfs/snapshot/latest
-docker compose exec zfsbox cat /mnt/test2/.zfs/snapshot/latest/test.txt
+docker compose up -d --wait --wait-timeout 90
+docker compose exec -T zfsbox zpool create test2 /data/test2.zpool
+docker compose exec -T zfsbox sh -lc 'echo test > /mnt/test2/test.txt'
+docker compose exec -T zfsbox cat /mnt/test2/test.txt
+docker compose exec -T zfsbox zfs set snapdir=visible test2
+docker compose exec -T zfsbox zfs snapshot test2@latest
+docker compose exec -T zfsbox ls /mnt/test2/.zfs/snapshot/latest
+docker compose exec -T zfsbox cat /mnt/test2/.zfs/snapshot/latest/test.txt
 
 # optionally mount it on the host outside of docker
-docker compose up -d   # starts the background nfsv4 server to allow mounting
 ./bin/zfsbox-mount 127.0.0.1:12049 test2 ./mnt/test2
 cat ./mnt/test2/test.txt
 cat ./mnt/test2/.zfs/snapshot/latest/test.txt
@@ -99,7 +97,10 @@ cat ./mnt/test2/.zfs/snapshot/latest/test.txt
 
 Notes:
 
-- The checked-in compose file now pulls the published multi-arch GHCR image by default instead of building locally. That makes first run much faster for normal users on both `linux/amd64` and `linux/arm64`.
+- The compose file pulls `ghcr.io/pirate/zfsbox:latest`, which is published for both `linux/amd64` and `linux/arm64`.
+- `docker compose up -d --wait --wait-timeout 90` blocks until the inner guest is healthy and exits with an error if that does not happen before the timeout.
+- The provided Compose service uses `CAP_SYS_ADMIN` so it can mount guest NFS exports at `/mnt/<pool>` inside the container. It does not require `privileged: true`.
+- On Docker Desktop, the first cold `up --wait` usually takes tens of seconds because it boots an inner Linux guest before any ZFS command runs.
 - If you are developing `zfsbox` itself locally, build your own image first and point compose at it:
 
 ```bash

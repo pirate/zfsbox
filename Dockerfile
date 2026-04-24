@@ -1,16 +1,107 @@
-FROM ubuntu:24.04
+FROM ubuntu:24.04 AS guest-rootfs
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG GUEST_RELEASE=noble
-ARG TARGETARCH
-ARG TARGETPLATFORM
+
+SHELL ["/bin/bash", "-lc"]
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
         ca-certificates \
-        cloud-image-utils \
+        initramfs-tools \
+        iproute2 \
+        kmod \
+        linux-image-virtual \
+        nfs-kernel-server \
+        openssh-server \
+        systemd-sysv \
+        udev \
+        zfsutils-linux \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY guest-assets/ /
+
+RUN set -Eeuo pipefail \
+    && mkdir -p \
+        /etc/exports.d \
+        /etc/systemd/system/basic.target.wants \
+        /etc/systemd/system/multi-user.target.wants \
+        /etc/systemd/system/zfsbox.target.wants \
+        /root/.ssh \
+        /run/sshd \
+        /srv/zfsbox/exports \
+    && chmod 0700 /root/.ssh \
+    && chmod 0755 \
+        /usr/local/sbin/zfsbox-ensure-nfs-server.sh \
+        /usr/local/sbin/zfsbox-mount-hostroot.sh \
+        /usr/local/sbin/zfsbox-guest-init.sh \
+        /usr/local/sbin/zfsbox-init \
+        /usr/local/sbin/zfsbox-sync-exports.sh \
+        /usr/local/sbin/zfsbox-write-ready.sh \
+    && ln -sf /usr/lib/systemd/system/systemd-networkd.service /etc/systemd/system/zfsbox.target.wants/systemd-networkd.service \
+    && ln -sf /usr/lib/systemd/system/ssh.socket /etc/systemd/system/zfsbox.target.wants/ssh.socket \
+    && ln -sf /etc/systemd/system/zfsbox-hostroot.service /etc/systemd/system/basic.target.wants/zfsbox-hostroot.service \
+    && ln -sf /etc/systemd/system/zfsbox-guest-init.service /etc/systemd/system/zfsbox.target.wants/zfsbox-guest-init.service \
+    && rm -f /etc/systemd/system/multi-user.target.wants/nfs-client.target \
+    && rm -f /etc/systemd/system/remote-fs.target.wants/nfs-client.target \
+    && rm -f /etc/systemd/system/multi-user.target.wants/nfs-server.service \
+    && rm -f /etc/systemd/system/multi-user.target.wants/rpcbind.service \
+    && rm -f /etc/systemd/system/sockets.target.wants/rpcbind.socket \
+    && rm -f /etc/systemd/system/nfs-client.target.wants/nfs-blkmap.service \
+    && truncate -s 0 /etc/machine-id \
+    && rm -f /var/lib/dbus/machine-id \
+    && ln -sf /dev/null /etc/systemd/system/apt-daily.service \
+    && ln -sf /dev/null /etc/systemd/system/apt-daily.timer \
+    && ln -sf /dev/null /etc/systemd/system/apt-daily-upgrade.service \
+    && ln -sf /dev/null /etc/systemd/system/apt-daily-upgrade.timer \
+    && ln -sf /dev/null /etc/systemd/system/systemd-networkd-wait-online.service \
+    && ln -sf /dev/null /etc/systemd/system/systemd-udev-settle.service \
+    && ln -sf /dev/null /etc/systemd/system/zfs-import-cache.service \
+    && ln -sf /dev/null /etc/systemd/system/zfs-mount.service \
+    && ln -sf /dev/null /etc/systemd/system/zfs-share.service \
+    && ln -sf /dev/null /etc/systemd/system/zfs-volume-wait.service \
+    && ln -sf /dev/null /etc/systemd/system/zfs.target \
+    && update-initramfs -c -k all
+
+FROM ubuntu:24.04 AS seed-builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+SHELL ["/bin/bash", "-lc"]
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        e2fsprogs \
+        qemu-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/zfsbox
+
+COPY . /opt/zfsbox
+COPY --from=guest-rootfs / /tmp/guest-rootfs
+
+RUN chmod +x /opt/zfsbox/bin/* /opt/zfsbox/scripts/*.sh \
+    && rm -rf /tmp/guest-rootfs/proc/* /tmp/guest-rootfs/sys/* /tmp/guest-rootfs/dev/* /tmp/guest-rootfs/run/* \
+    && mkdir -p /tmp/guest-rootfs/proc /tmp/guest-rootfs/sys /tmp/guest-rootfs/dev /tmp/guest-rootfs/run \
+    && /opt/zfsbox/scripts/build-seeded-linux-qemu-image.sh \
+        /tmp/guest-rootfs \
+        /opt/zfsbox/image-assets/ubuntu-seeded.qcow2 \
+        /opt/zfsbox/image-assets/guest-vmlinuz \
+        /opt/zfsbox/image-assets/guest-initrd.img
+
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+SHELL ["/bin/bash", "-lc"]
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
         curl \
+        fdisk \
         git \
         iproute2 \
         netcat-openbsd \
@@ -25,15 +116,10 @@ RUN apt-get update \
 
 WORKDIR /opt/zfsbox
 
-RUN mkdir -p /opt/zfsbox/image-assets \
-    && case "${TARGETARCH}" in \
-        amd64) guest_arch=amd64 ;; \
-        arm64) guest_arch=arm64 ;; \
-        *) echo "Unsupported Docker target architecture: ${TARGETARCH} (${TARGETPLATFORM})" >&2; exit 1 ;; \
-    esac \
-    && curl -fsSL "https://cloud-images.ubuntu.com/${GUEST_RELEASE}/current/${GUEST_RELEASE}-server-cloudimg-${guest_arch}.img" \
-        -o /opt/zfsbox/image-assets/ubuntu-cloudimg.qcow2
-
+COPY --from=seed-builder /opt/zfsbox/image-assets/ubuntu-seeded.qcow2 /opt/zfsbox/image-assets/ubuntu-seeded.qcow2
+COPY --from=seed-builder /opt/zfsbox/image-assets/guest-vmlinuz /opt/zfsbox/image-assets/guest-vmlinuz
+COPY --from=seed-builder /opt/zfsbox/image-assets/guest-initrd.img /opt/zfsbox/image-assets/guest-initrd.img
+COPY --from=seed-builder /opt/zfsbox/image-assets/guest-rootfs.uuid /opt/zfsbox/image-assets/guest-rootfs.uuid
 COPY . /opt/zfsbox
 
 RUN chmod +x /opt/zfsbox/bin/* /opt/zfsbox/scripts/*.sh \

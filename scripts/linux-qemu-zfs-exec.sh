@@ -15,7 +15,9 @@ shift
 for arg in "$@"; do
     case "${arg}" in
         /*)
-            if [[ -e "${arg}" ]]; then
+            if guest_device="$(linux_qemu_guest_device_for_host_path "${arg}" 2>/dev/null)"; then
+                translated_args+=("${guest_device}")
+            elif [[ -e "${arg}" ]]; then
                 translated_args+=("${LINUX_QEMU_HOST_ROOT_MOUNT}${arg}")
             else
                 translated_args+=("${arg}")

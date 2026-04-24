@@ -1,0 +1,13 @@
+[Unit]
+Description=Prepare zfsbox guest control plane
+After=zfsbox-hostroot.service
+Wants=zfsbox-hostroot.service
+Before=ssh.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/zfsbox-guest-init.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=zfsbox.target

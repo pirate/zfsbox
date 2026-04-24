@@ -5,12 +5,33 @@ services:
     environment:
       VM_SSH_PORT: "${VM_SSH_PORT:-12022}"
       VM_NFS_PORT: "${VM_NFS_PORT:-12049}"
+      LINUX_QEMU_WAIT_TIMEOUT: "${LINUX_QEMU_WAIT_TIMEOUT:-55}"
+      LINUX_QEMU_GUEST_SETUP_TIMEOUT_SECONDS: "${LINUX_QEMU_GUEST_SETUP_TIMEOUT_SECONDS:-20}"
     cap_add:
       - SYS_ADMIN
     ports:
       - "127.0.0.1:${VM_SSH_PORT:-12022}:${VM_SSH_PORT:-12022}"
       - "127.0.0.1:${VM_NFS_PORT:-12049}:${VM_NFS_PORT:-12049}"
-    command: ["sleep", "infinity"]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          bash -lc '
+          source /opt/zfsbox/scripts/linux-qemu-common.sh;
+          linux_qemu_is_running || { echo "zfsbox healthcheck: qemu is not running yet"; tail -n 20 "$${LINUX_QEMU_SERIAL_LOG}" || true; exit 1; };
+          [[ -s "$${LINUX_QEMU_READY_FILE}" ]] || { echo "zfsbox healthcheck: guest is not ready yet"; tail -n 20 "$${LINUX_QEMU_SERIAL_LOG}" || true; exit 1; }'
+      interval: 1s
+      timeout: 5s
+      retries: 45
+      start_period: 1s
+    command:
+      - bash
+      - -lc
+      - |
+        set -Eeuo pipefail
+        source /opt/zfsbox/scripts/linux-qemu-common.sh
+        linux_qemu_ensure_vm_running
+        exec sleep infinity
     working_dir: /data
     volumes:
       - ./data:/data

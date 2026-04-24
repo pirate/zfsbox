@@ -1,0 +1,13 @@
+[Unit]
+Description=Mount zfsbox host root
+DefaultDependencies=no
+After=local-fs.target
+Before=basic.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/zfsbox-mount-hostroot.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=basic.target

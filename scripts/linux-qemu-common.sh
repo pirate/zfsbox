@@ -16,13 +16,27 @@ LINUX_QEMU_ASSETS_DIR="${LINUX_QEMU_STATE_DIR}/assets"
 LINUX_QEMU_CLOUD_DIR="${LINUX_QEMU_STATE_DIR}/cloud"
 LINUX_QEMU_PID_FILE="${LINUX_QEMU_STATE_DIR}/qemu.pid"
 LINUX_QEMU_SERIAL_LOG="${LINUX_QEMU_STATE_DIR}/serial.log"
+LINUX_QEMU_READY_FILE="${LINUX_QEMU_STATE_DIR}/guest-ready"
+LINUX_QEMU_GUEST_BOOTSTRAP_MARKER_FILE="${LINUX_QEMU_STATE_DIR}/guest-bootstrap.pid"
 LINUX_QEMU_KNOWN_HOSTS="${LINUX_QEMU_STATE_DIR}/known_hosts"
 LINUX_QEMU_HOST_KEY="${LINUX_QEMU_STATE_DIR}/id_ed25519"
 LINUX_QEMU_HOST_KEY_PUB="${LINUX_QEMU_HOST_KEY}.pub"
 LINUX_QEMU_KNOWN_POOL_PATHS_FILE="${LINUX_QEMU_STATE_DIR}/known-pool-paths.tsv"
+LINUX_QEMU_ATTACHED_FILES_FILE="${LINUX_QEMU_STATE_DIR}/attached-files.txt"
 LINUX_QEMU_BASE_IMAGE="${LINUX_QEMU_ASSETS_DIR}/ubuntu-cloudimg.qcow2"
-LINUX_QEMU_BUNDLED_BASE_IMAGE="${LINUX_QEMU_BUNDLED_BASE_IMAGE:-${PROJECT_DIR}/image-assets/ubuntu-cloudimg.qcow2}"
+LINUX_QEMU_SEEDED_BUNDLED_BASE_IMAGE="${PROJECT_DIR}/image-assets/ubuntu-seeded.qcow2"
+if [[ -z "${LINUX_QEMU_BUNDLED_BASE_IMAGE:-}" ]]; then
+    if [[ -f "${LINUX_QEMU_SEEDED_BUNDLED_BASE_IMAGE}" ]]; then
+        LINUX_QEMU_BUNDLED_BASE_IMAGE="${LINUX_QEMU_SEEDED_BUNDLED_BASE_IMAGE}"
+    else
+        LINUX_QEMU_BUNDLED_BASE_IMAGE="${PROJECT_DIR}/image-assets/ubuntu-cloudimg.qcow2"
+    fi
+fi
+LINUX_QEMU_BASE_IMAGE_KIND="${LINUX_QEMU_BASE_IMAGE_KIND:-generic}"
 LINUX_QEMU_BASE_IMAGE_MARKER_FILE="${LINUX_QEMU_ASSETS_DIR}/base-image.marker"
+LINUX_QEMU_BUNDLED_KERNEL_IMAGE="${LINUX_QEMU_BUNDLED_KERNEL_IMAGE:-${PROJECT_DIR}/image-assets/guest-vmlinuz}"
+LINUX_QEMU_BUNDLED_INITRD_IMAGE="${LINUX_QEMU_BUNDLED_INITRD_IMAGE:-${PROJECT_DIR}/image-assets/guest-initrd.img}"
+LINUX_QEMU_BUNDLED_ROOTFS_UUID_FILE="${LINUX_QEMU_BUNDLED_ROOTFS_UUID_FILE:-${PROJECT_DIR}/image-assets/guest-rootfs.uuid}"
 LINUX_QEMU_ARM64_EFI_CODE_IMAGE="${LINUX_QEMU_ASSETS_DIR}/arm64-efi-code.img"
 LINUX_QEMU_ARM64_EFI_VARS_IMAGE="${LINUX_QEMU_ASSETS_DIR}/arm64-efi-vars.img"
 LINUX_QEMU_OVERLAY_IMAGE="${LINUX_QEMU_ASSETS_DIR}/rootfs-overlay.qcow2"
@@ -30,7 +44,7 @@ LINUX_QEMU_SEED_IMAGE="${LINUX_QEMU_ASSETS_DIR}/seed.img"
 LINUX_QEMU_USER_DATA="${LINUX_QEMU_CLOUD_DIR}/user-data"
 LINUX_QEMU_META_DATA="${LINUX_QEMU_CLOUD_DIR}/meta-data"
 LINUX_QEMU_MARKER_FILE="${LINUX_QEMU_STATE_DIR}/instance.marker"
-LINUX_QEMU_LAYOUT_VERSION="${LINUX_QEMU_LAYOUT_VERSION:-1}"
+LINUX_QEMU_LAYOUT_VERSION="${LINUX_QEMU_LAYOUT_VERSION:-2}"
 LINUX_QEMU_VM_NAME="${LINUX_QEMU_VM_NAME:-zfsbox-linux}"
 LINUX_QEMU_HOST_SHARE="${LINUX_QEMU_HOST_SHARE:-/}"
 LINUX_QEMU_HOST_ROOT_MOUNT="${LINUX_QEMU_HOST_ROOT_MOUNT:-/host}"
@@ -40,6 +54,69 @@ VM_MEMORY_MB="${VM_MEMORY_MB:-2048}"
 VM_VCPUS="${VM_VCPUS:-2}"
 GUEST_RELEASE="${GUEST_RELEASE:-noble}"
 LINUX_QEMU_GUEST_HOST="${LINUX_QEMU_GUEST_HOST:-127.0.0.1}"
+LINUX_QEMU_ATTACH_ROOT="${LINUX_QEMU_ATTACH_ROOT:-/data}"
+
+linux_qemu_collect_attached_files() {
+    local root="${LINUX_QEMU_ATTACH_ROOT}"
+
+    [[ -d "${root}" ]] || return 0
+
+    find "${root}" -mindepth 1 -maxdepth 1 -type f ! -path "${root}/.zfsbox/*" -print 2>/dev/null | sort
+}
+
+linux_qemu_prepare_attached_file() {
+    local path="$1"
+
+    [[ -f "${path}" ]] || return 0
+
+    if sfdisk -d "${path}" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    printf 'label: gpt\n,;\n' | sfdisk --quiet "${path}" >/dev/null 2>&1
+}
+
+linux_qemu_write_attached_files_manifest() {
+    local path
+
+    linux_qemu_init_dirs
+    : > "${LINUX_QEMU_ATTACHED_FILES_FILE}"
+    while IFS= read -r path; do
+        [[ -n "${path}" ]] || continue
+        linux_qemu_prepare_attached_file "${path}"
+        printf '%s\n' "${path}" >> "${LINUX_QEMU_ATTACHED_FILES_FILE}"
+    done < <(linux_qemu_collect_attached_files)
+}
+
+linux_qemu_attached_files_signature() {
+    if [[ -f "${LINUX_QEMU_ATTACHED_FILES_FILE}" ]]; then
+        tr '\n' '|' < "${LINUX_QEMU_ATTACHED_FILES_FILE}"
+    fi
+}
+
+linux_qemu_guest_device_for_host_path() {
+    local host_path="$1"
+    local index=0
+    local path
+    local letter
+
+    if [[ ! -f "${LINUX_QEMU_ATTACHED_FILES_FILE}" ]]; then
+        linux_qemu_write_attached_files_manifest
+    fi
+
+    [[ -f "${LINUX_QEMU_ATTACHED_FILES_FILE}" ]] || return 1
+
+    while IFS= read -r path; do
+        [[ -n "${path}" ]] || continue
+        if [[ "${path}" == "${host_path}" ]]; then
+            printf '/dev/zfsbox/zfsbox-data-%d-part1\n' "${index}"
+            return 0
+        fi
+        index=$((index + 1))
+    done < "${LINUX_QEMU_ATTACHED_FILES_FILE}"
+
+    return 1
+}
 
 linux_qemu_log() {
     printf 'zfsbox: %s\n' "$*" >&2
@@ -50,9 +127,9 @@ linux_qemu_inside_container() {
 }
 
 linux_qemu_ssh_run() {
-    local timeout_seconds="${LINUX_QEMU_SSH_TIMEOUT_SECONDS:-10}"
+    local timeout_seconds="${LINUX_QEMU_SSH_TIMEOUT_SECONDS:-}"
 
-    if command -v timeout >/dev/null 2>&1; then
+    if [[ -n "${timeout_seconds}" && "${timeout_seconds}" != "0" ]] && command -v timeout >/dev/null 2>&1; then
         timeout "${timeout_seconds}" ssh "$@"
         return
     fi
@@ -129,11 +206,59 @@ linux_qemu_require_dependencies() {
     linux_qemu_require_cmd qemu-img
     linux_qemu_require_cmd ssh
     linux_qemu_require_cmd ssh-keygen
-    linux_qemu_find_seed_builder
 }
 
 linux_qemu_init_dirs() {
     mkdir -p "${LINUX_QEMU_STATE_DIR}" "${LINUX_QEMU_ASSETS_DIR}" "${LINUX_QEMU_CLOUD_DIR}"
+}
+
+linux_qemu_classify_base_image() {
+    local image_path="$1"
+
+    case "${image_path}" in
+        *ubuntu-seeded.qcow2|*seeded*.qcow2)
+            LINUX_QEMU_BASE_IMAGE_KIND="seeded"
+            ;;
+        *)
+            LINUX_QEMU_BASE_IMAGE_KIND="generic"
+            ;;
+    esac
+}
+
+linux_qemu_use_direct_kernel_boot() {
+    [[ -f "${LINUX_QEMU_BUNDLED_KERNEL_IMAGE}" && -f "${LINUX_QEMU_BUNDLED_INITRD_IMAGE}" ]]
+}
+
+linux_qemu_use_baked_guest_init() {
+    linux_qemu_use_direct_kernel_boot && [[ "${LINUX_QEMU_BASE_IMAGE_KIND}" == "seeded" ]]
+}
+
+linux_qemu_kernel_cmdline() {
+    local console
+    local init_arg=""
+
+    if [[ "${LINUX_QEMU_ARCH}" == "arm64" ]]; then
+        console="ttyAMA0"
+    else
+        console="ttyS0"
+    fi
+
+    if linux_qemu_use_baked_guest_init; then
+        init_arg=" init=/usr/local/sbin/zfsbox-init"
+    fi
+
+    local root_arg="root=/dev/vda"
+
+    if [[ -f "${LINUX_QEMU_BUNDLED_ROOTFS_UUID_FILE}" ]]; then
+        root_arg="root=UUID=$(tr -d '[:space:]' < "${LINUX_QEMU_BUNDLED_ROOTFS_UUID_FILE}")"
+    fi
+
+    printf '%s rw rootfstype=ext4 console=%s fsck.mode=skip apparmor=0 loglevel=4 systemd.show_status=1 zfsbox.state_dir=%s zfsbox.host_root_mount=%s%s' \
+        "${root_arg}" \
+        "${console}" \
+        "${LINUX_QEMU_STATE_DIR}" \
+        "${LINUX_QEMU_HOST_ROOT_MOUNT}" \
+        "${init_arg}"
 }
 
 linux_qemu_record_known_pool_paths() {
@@ -147,7 +272,6 @@ linux_qemu_record_known_pool_paths() {
     linux_qemu_init_dirs
     existing_file="$(mktemp)"
     new_file="$(mktemp)"
-    trap 'rm -f "${existing_file}" "${new_file}"' RETURN
 
     if [[ -f "${LINUX_QEMU_KNOWN_POOL_PATHS_FILE}" ]]; then
         grep -Fv "$(printf '%s\t' "${pool}")" "${LINUX_QEMU_KNOWN_POOL_PATHS_FILE}" > "${existing_file}" || true
@@ -164,6 +288,7 @@ linux_qemu_record_known_pool_paths() {
     done
 
     sort -u "${new_file}" > "${LINUX_QEMU_KNOWN_POOL_PATHS_FILE}"
+    rm -f "${existing_file}" "${new_file}"
 }
 
 linux_qemu_forget_known_pool() {
@@ -174,9 +299,9 @@ linux_qemu_forget_known_pool() {
     [[ -f "${LINUX_QEMU_KNOWN_POOL_PATHS_FILE}" ]] || return 0
 
     tmp_file="$(mktemp)"
-    trap 'rm -f "${tmp_file}"' RETURN
     grep -Fv "$(printf '%s\t' "${pool}")" "${LINUX_QEMU_KNOWN_POOL_PATHS_FILE}" > "${tmp_file}" || true
     sort -u "${tmp_file}" > "${LINUX_QEMU_KNOWN_POOL_PATHS_FILE}"
+    rm -f "${tmp_file}"
 }
 
 linux_qemu_rename_known_pool() {
@@ -188,7 +313,6 @@ linux_qemu_rename_known_pool() {
     [[ -f "${LINUX_QEMU_KNOWN_POOL_PATHS_FILE}" ]] || return 0
 
     tmp_file="$(mktemp)"
-    trap 'rm -f "${tmp_file}"' RETURN
 
     awk -F '\t' -v old_pool="${old_pool}" -v new_pool="${new_pool}" '
         BEGIN { OFS = "\t" }
@@ -236,18 +360,25 @@ EOF
     current="$(cat "${LINUX_QEMU_BASE_IMAGE_MARKER_FILE}" 2>/dev/null || true)"
 
     if [[ -f "${LINUX_QEMU_BASE_IMAGE}" && "${current}" == "${expected}" ]]; then
+        if [[ -f "${LINUX_QEMU_BUNDLED_BASE_IMAGE}" ]]; then
+            linux_qemu_classify_base_image "${LINUX_QEMU_BUNDLED_BASE_IMAGE}"
+        else
+            linux_qemu_classify_base_image "${LINUX_QEMU_BASE_IMAGE}"
+        fi
         return
     fi
 
     rm -f "${LINUX_QEMU_BASE_IMAGE}"
 
     if [[ -f "${LINUX_QEMU_BUNDLED_BASE_IMAGE}" ]]; then
-        linux_qemu_log "seeding Ubuntu cloud image (${GUEST_RELEASE})"
+        linux_qemu_classify_base_image "${LINUX_QEMU_BUNDLED_BASE_IMAGE}"
+        linux_qemu_log "using bundled seeded guest image (${GUEST_RELEASE})"
         cp "${LINUX_QEMU_BUNDLED_BASE_IMAGE}" "${LINUX_QEMU_BASE_IMAGE}"
         printf '%s\n' "${expected}" > "${LINUX_QEMU_BASE_IMAGE_MARKER_FILE}"
         return
     fi
 
+    LINUX_QEMU_BASE_IMAGE_KIND="generic"
     url="$(linux_qemu_guest_image_url)"
     linux_qemu_log "downloading Ubuntu cloud image (${GUEST_RELEASE})"
     curl -fsSL "${url}" -o "${LINUX_QEMU_BASE_IMAGE}"
@@ -264,8 +395,24 @@ linux_qemu_ensure_host_key() {
 
 linux_qemu_render_cloud_init() {
     local pubkey
+    local package_update_line package_block
 
     pubkey="$(cat "${LINUX_QEMU_HOST_KEY_PUB}")"
+    linux_qemu_classify_base_image "${LINUX_QEMU_BUNDLED_BASE_IMAGE}"
+
+    if [[ "${LINUX_QEMU_BASE_IMAGE_KIND}" == "seeded" ]]; then
+        package_update_line="package_update: false"
+        package_block=""
+    else
+        package_update_line="package_update: true"
+        package_block="$(cat <<'EOF'
+packages:
+  - openssh-server
+  - nfs-kernel-server
+  - zfsutils-linux
+EOF
+)"
+    fi
 
     cat > "${LINUX_QEMU_META_DATA}" <<EOF
 instance-id: ${LINUX_QEMU_VM_NAME}
@@ -274,14 +421,11 @@ EOF
 
     cat > "${LINUX_QEMU_USER_DATA}" <<EOF
 #cloud-config
-package_update: true
+${package_update_line}
 package_upgrade: false
 ssh_pwauth: false
 disable_root: false
-packages:
-  - openssh-server
-  - nfs-kernel-server
-  - zfsutils-linux
+${package_block}
 write_files:
   - path: /root/.ssh/authorized_keys
     permissions: "0600"
@@ -332,6 +476,7 @@ EOF
 }
 
 linux_qemu_build_seed_image() {
+    linux_qemu_find_seed_builder
     rm -f "${LINUX_QEMU_SEED_IMAGE}"
 
     case "${LINUX_QEMU_SEED_BUILDER}" in
@@ -360,23 +505,34 @@ VM_MEMORY_MB=${VM_MEMORY_MB}
 VM_VCPUS=${VM_VCPUS}
 VM_SSH_PORT=${VM_SSH_PORT}
 VM_NFS_PORT=${VM_NFS_PORT}
+LINUX_QEMU_BUNDLED_KERNEL_IMAGE=${LINUX_QEMU_BUNDLED_KERNEL_IMAGE}
+LINUX_QEMU_BUNDLED_INITRD_IMAGE=${LINUX_QEMU_BUNDLED_INITRD_IMAGE}
+LINUX_QEMU_STATE_DIR=${LINUX_QEMU_STATE_DIR}
+LINUX_QEMU_ATTACHED_FILES=$(linux_qemu_attached_files_signature)
 EOF
 }
 
 linux_qemu_reset_instance_if_needed() {
     local expected current
 
+    linux_qemu_write_attached_files_manifest
     expected="$(linux_qemu_expected_marker)"
     current="$(cat "${LINUX_QEMU_MARKER_FILE}" 2>/dev/null || true)"
 
-    if [[ "${current}" == "${expected}" && -f "${LINUX_QEMU_OVERLAY_IMAGE}" && -f "${LINUX_QEMU_SEED_IMAGE}" ]]; then
+    if linux_qemu_use_baked_guest_init; then
+        if [[ "${current}" == "${expected}" && -f "${LINUX_QEMU_OVERLAY_IMAGE}" ]]; then
+            return
+        fi
+    elif [[ "${current}" == "${expected}" && -f "${LINUX_QEMU_OVERLAY_IMAGE}" && -f "${LINUX_QEMU_SEED_IMAGE}" ]]; then
         return
     fi
 
-    rm -f "${LINUX_QEMU_OVERLAY_IMAGE}" "${LINUX_QEMU_SEED_IMAGE}" "${LINUX_QEMU_KNOWN_HOSTS}"
+    rm -f "${LINUX_QEMU_OVERLAY_IMAGE}" "${LINUX_QEMU_SEED_IMAGE}" "${LINUX_QEMU_KNOWN_HOSTS}" "${LINUX_QEMU_READY_FILE}" "${LINUX_QEMU_GUEST_BOOTSTRAP_MARKER_FILE}"
     qemu-img create -f qcow2 -F qcow2 -b "${LINUX_QEMU_BASE_IMAGE}" "${LINUX_QEMU_OVERLAY_IMAGE}" >/dev/null
-    linux_qemu_render_cloud_init
-    linux_qemu_build_seed_image
+    if ! linux_qemu_use_baked_guest_init; then
+        linux_qemu_render_cloud_init
+        linux_qemu_build_seed_image
+    fi
     printf '%s\n' "${expected}" > "${LINUX_QEMU_MARKER_FILE}"
 }
 
@@ -392,12 +548,36 @@ linux_qemu_is_running() {
     kill -0 "${pid}" 2>/dev/null
 }
 
+linux_qemu_current_pid() {
+    cat "${LINUX_QEMU_PID_FILE}" 2>/dev/null || true
+}
+
+linux_qemu_bootstrap_complete_for_current_vm() {
+    local current_pid
+
+    current_pid="$(linux_qemu_current_pid)"
+    [[ -n "${current_pid}" ]] || return 1
+    [[ -f "${LINUX_QEMU_GUEST_BOOTSTRAP_MARKER_FILE}" ]] || return 1
+    [[ "$(cat "${LINUX_QEMU_GUEST_BOOTSTRAP_MARKER_FILE}" 2>/dev/null || true)" == "${current_pid}" ]]
+}
+
+linux_qemu_mark_bootstrap_complete() {
+    local current_pid
+
+    current_pid="$(linux_qemu_current_pid)"
+    [[ -n "${current_pid}" ]] || return 0
+    printf '%s\n' "${current_pid}" > "${LINUX_QEMU_GUEST_BOOTSTRAP_MARKER_FILE}"
+}
+
 linux_qemu_start_vm() {
     local accel
     local stderr_file status=0
+    local -a extra_x86_drive_args=()
+    local -a extra_arm_drive_args=()
+    local attached_path=""
+    local attached_index=0
 
     stderr_file="$(mktemp)"
-    trap 'rm -f "${stderr_file}"' RETURN
 
     accel="tcg"
     if [[ -r /dev/kvm && -w /dev/kvm ]]; then
@@ -407,49 +587,164 @@ linux_qemu_start_vm() {
         fi
     fi
 
-    rm -f "${LINUX_QEMU_PID_FILE}"
+    rm -f "${LINUX_QEMU_PID_FILE}" "${LINUX_QEMU_READY_FILE}"
     : > "${LINUX_QEMU_SERIAL_LOG}"
+
+    if [[ -f "${LINUX_QEMU_ATTACHED_FILES_FILE}" ]]; then
+        while IFS= read -r attached_path; do
+            [[ -n "${attached_path}" ]] || continue
+            if [[ "${LINUX_QEMU_ARCH}" == "arm64" ]]; then
+                extra_arm_drive_args+=(
+                    -drive "if=none,format=raw,file=${attached_path},id=datadrive${attached_index}"
+                    -device "virtio-blk-device,drive=datadrive${attached_index},serial=zfsbox-data-${attached_index}"
+                )
+            else
+                extra_x86_drive_args+=(
+                    -drive "if=none,format=raw,file=${attached_path},id=datadrive${attached_index}"
+                    -device "virtio-blk-pci,drive=datadrive${attached_index},serial=zfsbox-data-${attached_index}"
+                )
+            fi
+            attached_index=$((attached_index + 1))
+        done < "${LINUX_QEMU_ATTACHED_FILES_FILE}"
+    fi
 
     linux_qemu_log "starting rootless Linux VM"
     if [[ "${LINUX_QEMU_ARCH}" == "arm64" ]]; then
-        "${LINUX_QEMU_QEMU_BIN}" \
-            -name "${LINUX_QEMU_VM_NAME}" \
-            -machine "${LINUX_QEMU_MACHINE},accel=${accel}" \
-            -cpu "${LINUX_QEMU_CPU}" \
-            -smp "${VM_VCPUS}" \
-            -m "${VM_MEMORY_MB}" \
-            -display none \
-            -serial "file:${LINUX_QEMU_SERIAL_LOG}" \
-            -daemonize \
-            -pidfile "${LINUX_QEMU_PID_FILE}" \
-            -device virtio-rng-device \
-            -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22,hostfwd=tcp:127.0.0.1:${VM_NFS_PORT}-:2049" \
-            -device virtio-net-device,netdev=net0 \
-            -drive "if=pflash,format=raw,unit=0,readonly=on,file=${LINUX_QEMU_ARM64_EFI_CODE_IMAGE}" \
-            -drive "if=pflash,format=raw,unit=1,file=${LINUX_QEMU_ARM64_EFI_VARS_IMAGE}" \
-            -drive "if=none,format=qcow2,file=${LINUX_QEMU_OVERLAY_IMAGE},id=rootfs" \
-            -device virtio-blk-device,drive=rootfs \
-            -drive "if=none,format=raw,file=${LINUX_QEMU_SEED_IMAGE},id=seed" \
-            -device virtio-blk-device,drive=seed \
-            -virtfs "local,id=hostroot,path=${LINUX_QEMU_HOST_SHARE},mount_tag=hostroot,security_model=none,multidevs=remap" \
-            2>"${stderr_file}" || status=$?
+        if linux_qemu_use_direct_kernel_boot; then
+            if linux_qemu_use_baked_guest_init; then
+                "${LINUX_QEMU_QEMU_BIN}" \
+                    -name "${LINUX_QEMU_VM_NAME}" \
+                    -machine "${LINUX_QEMU_MACHINE},accel=${accel}" \
+                    -cpu "${LINUX_QEMU_CPU}" \
+                    -smp "${VM_VCPUS}" \
+                    -m "${VM_MEMORY_MB}" \
+                    -display none \
+                    -serial "file:${LINUX_QEMU_SERIAL_LOG}" \
+                    -daemonize \
+                    -pidfile "${LINUX_QEMU_PID_FILE}" \
+                    -device virtio-rng-device \
+                    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22,hostfwd=tcp:127.0.0.1:${VM_NFS_PORT}-:2049" \
+                    -device virtio-net-device,netdev=net0 \
+                    -kernel "${LINUX_QEMU_BUNDLED_KERNEL_IMAGE}" \
+                    -initrd "${LINUX_QEMU_BUNDLED_INITRD_IMAGE}" \
+                    -append "$(linux_qemu_kernel_cmdline)" \
+                    -drive "if=none,format=qcow2,file=${LINUX_QEMU_OVERLAY_IMAGE},id=rootfs" \
+                    -device virtio-blk-device,drive=rootfs \
+                    "${extra_arm_drive_args[@]}" \
+                    -virtfs "local,id=hostroot,path=${LINUX_QEMU_HOST_SHARE},mount_tag=hostroot,security_model=none,multidevs=remap" \
+                    2>"${stderr_file}" || status=$?
+            else
+                "${LINUX_QEMU_QEMU_BIN}" \
+                    -name "${LINUX_QEMU_VM_NAME}" \
+                    -machine "${LINUX_QEMU_MACHINE},accel=${accel}" \
+                    -cpu "${LINUX_QEMU_CPU}" \
+                    -smp "${VM_VCPUS}" \
+                    -m "${VM_MEMORY_MB}" \
+                    -display none \
+                    -serial "file:${LINUX_QEMU_SERIAL_LOG}" \
+                    -daemonize \
+                    -pidfile "${LINUX_QEMU_PID_FILE}" \
+                    -device virtio-rng-device \
+                    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22,hostfwd=tcp:127.0.0.1:${VM_NFS_PORT}-:2049" \
+                    -device virtio-net-device,netdev=net0 \
+                    -kernel "${LINUX_QEMU_BUNDLED_KERNEL_IMAGE}" \
+                    -initrd "${LINUX_QEMU_BUNDLED_INITRD_IMAGE}" \
+                    -append "$(linux_qemu_kernel_cmdline)" \
+                    -drive "if=none,format=qcow2,file=${LINUX_QEMU_OVERLAY_IMAGE},id=rootfs" \
+                    -device virtio-blk-device,drive=rootfs \
+                    "${extra_arm_drive_args[@]}" \
+                    -drive "if=none,format=raw,file=${LINUX_QEMU_SEED_IMAGE},id=seed" \
+                    -device virtio-blk-device,drive=seed \
+                    -virtfs "local,id=hostroot,path=${LINUX_QEMU_HOST_SHARE},mount_tag=hostroot,security_model=none,multidevs=remap" \
+                    2>"${stderr_file}" || status=$?
+            fi
+        else
+            "${LINUX_QEMU_QEMU_BIN}" \
+                -name "${LINUX_QEMU_VM_NAME}" \
+                -machine "${LINUX_QEMU_MACHINE},accel=${accel}" \
+                -cpu "${LINUX_QEMU_CPU}" \
+                -smp "${VM_VCPUS}" \
+                -m "${VM_MEMORY_MB}" \
+                -display none \
+                -serial "file:${LINUX_QEMU_SERIAL_LOG}" \
+                -daemonize \
+                -pidfile "${LINUX_QEMU_PID_FILE}" \
+                -device virtio-rng-device \
+                -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22,hostfwd=tcp:127.0.0.1:${VM_NFS_PORT}-:2049" \
+                -device virtio-net-device,netdev=net0 \
+                -drive "if=pflash,format=raw,unit=0,readonly=on,file=${LINUX_QEMU_ARM64_EFI_CODE_IMAGE}" \
+                -drive "if=pflash,format=raw,unit=1,file=${LINUX_QEMU_ARM64_EFI_VARS_IMAGE}" \
+                -drive "if=none,format=qcow2,file=${LINUX_QEMU_OVERLAY_IMAGE},id=rootfs" \
+                -device virtio-blk-device,drive=rootfs \
+                "${extra_arm_drive_args[@]}" \
+                -drive "if=none,format=raw,file=${LINUX_QEMU_SEED_IMAGE},id=seed" \
+                -device virtio-blk-device,drive=seed \
+                -virtfs "local,id=hostroot,path=${LINUX_QEMU_HOST_SHARE},mount_tag=hostroot,security_model=none,multidevs=remap" \
+                2>"${stderr_file}" || status=$?
+        fi
     else
-        "${LINUX_QEMU_QEMU_BIN}" \
-            -name "${LINUX_QEMU_VM_NAME}" \
-            -machine "${LINUX_QEMU_MACHINE},accel=${accel}" \
-            -cpu "${LINUX_QEMU_CPU}" \
-            -smp "${VM_VCPUS}" \
-            -m "${VM_MEMORY_MB}" \
-            -display none \
-            -serial "file:${LINUX_QEMU_SERIAL_LOG}" \
-            -daemonize \
-            -pidfile "${LINUX_QEMU_PID_FILE}" \
-            -device virtio-rng-pci \
-            -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22,hostfwd=tcp:127.0.0.1:${VM_NFS_PORT}-:2049" \
-            -drive "if=virtio,format=qcow2,file=${LINUX_QEMU_OVERLAY_IMAGE}" \
-            -drive "if=virtio,format=raw,media=cdrom,file=${LINUX_QEMU_SEED_IMAGE}" \
-            -virtfs "local,id=hostroot,path=${LINUX_QEMU_HOST_SHARE},mount_tag=hostroot,security_model=none,multidevs=remap" \
-            2>"${stderr_file}" || status=$?
+        if linux_qemu_use_direct_kernel_boot; then
+            if linux_qemu_use_baked_guest_init; then
+                "${LINUX_QEMU_QEMU_BIN}" \
+                    -name "${LINUX_QEMU_VM_NAME}" \
+                    -machine "${LINUX_QEMU_MACHINE},accel=${accel}" \
+                    -cpu "${LINUX_QEMU_CPU}" \
+                    -smp "${VM_VCPUS}" \
+                    -m "${VM_MEMORY_MB}" \
+                    -display none \
+                    -serial "file:${LINUX_QEMU_SERIAL_LOG}" \
+                    -daemonize \
+                    -pidfile "${LINUX_QEMU_PID_FILE}" \
+                    -device virtio-rng-pci \
+                    -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22,hostfwd=tcp:127.0.0.1:${VM_NFS_PORT}-:2049" \
+                    -kernel "${LINUX_QEMU_BUNDLED_KERNEL_IMAGE}" \
+                    -initrd "${LINUX_QEMU_BUNDLED_INITRD_IMAGE}" \
+                    -append "$(linux_qemu_kernel_cmdline)" \
+                    -drive "if=virtio,format=qcow2,file=${LINUX_QEMU_OVERLAY_IMAGE}" \
+                    "${extra_x86_drive_args[@]}" \
+                    -virtfs "local,id=hostroot,path=${LINUX_QEMU_HOST_SHARE},mount_tag=hostroot,security_model=none,multidevs=remap" \
+                    2>"${stderr_file}" || status=$?
+            else
+                "${LINUX_QEMU_QEMU_BIN}" \
+                    -name "${LINUX_QEMU_VM_NAME}" \
+                    -machine "${LINUX_QEMU_MACHINE},accel=${accel}" \
+                    -cpu "${LINUX_QEMU_CPU}" \
+                    -smp "${VM_VCPUS}" \
+                    -m "${VM_MEMORY_MB}" \
+                    -display none \
+                    -serial "file:${LINUX_QEMU_SERIAL_LOG}" \
+                    -daemonize \
+                    -pidfile "${LINUX_QEMU_PID_FILE}" \
+                    -device virtio-rng-pci \
+                    -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22,hostfwd=tcp:127.0.0.1:${VM_NFS_PORT}-:2049" \
+                    -kernel "${LINUX_QEMU_BUNDLED_KERNEL_IMAGE}" \
+                    -initrd "${LINUX_QEMU_BUNDLED_INITRD_IMAGE}" \
+                    -append "$(linux_qemu_kernel_cmdline)" \
+                    -drive "if=virtio,format=qcow2,file=${LINUX_QEMU_OVERLAY_IMAGE}" \
+                    "${extra_x86_drive_args[@]}" \
+                    -drive "if=virtio,format=raw,media=cdrom,file=${LINUX_QEMU_SEED_IMAGE}" \
+                    -virtfs "local,id=hostroot,path=${LINUX_QEMU_HOST_SHARE},mount_tag=hostroot,security_model=none,multidevs=remap" \
+                    2>"${stderr_file}" || status=$?
+            fi
+        else
+            "${LINUX_QEMU_QEMU_BIN}" \
+                -name "${LINUX_QEMU_VM_NAME}" \
+                -machine "${LINUX_QEMU_MACHINE},accel=${accel}" \
+                -cpu "${LINUX_QEMU_CPU}" \
+                -smp "${VM_VCPUS}" \
+                -m "${VM_MEMORY_MB}" \
+                -display none \
+                -serial "file:${LINUX_QEMU_SERIAL_LOG}" \
+                -daemonize \
+                -pidfile "${LINUX_QEMU_PID_FILE}" \
+                -device virtio-rng-pci \
+                -nic "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22,hostfwd=tcp:127.0.0.1:${VM_NFS_PORT}-:2049" \
+                -drive "if=virtio,format=qcow2,file=${LINUX_QEMU_OVERLAY_IMAGE}" \
+                "${extra_x86_drive_args[@]}" \
+                -drive "if=virtio,format=raw,media=cdrom,file=${LINUX_QEMU_SEED_IMAGE}" \
+                -virtfs "local,id=hostroot,path=${LINUX_QEMU_HOST_SHARE},mount_tag=hostroot,security_model=none,multidevs=remap" \
+                2>"${stderr_file}" || status=$?
+        fi
     fi
 
     if [[ "${status}" -ne 0 ]]; then
@@ -468,8 +763,11 @@ EOF
         fi
 
         cat "${stderr_file}" >&2
+        rm -f "${stderr_file}"
         return "${status}"
     fi
+
+    rm -f "${stderr_file}"
 }
 
 linux_qemu_try_use_shared_vm() {
@@ -504,6 +802,10 @@ linux_qemu_wait_for_guest() {
     local timeout="${LINUX_QEMU_WAIT_TIMEOUT:-600}"
 
     while (( waited < timeout )); do
+        if linux_qemu_use_baked_guest_init && [[ -s "${LINUX_QEMU_READY_FILE}" ]]; then
+            return 0
+        fi
+
         if linux_qemu_ssh_run \
             -F /dev/null \
             -o BatchMode=yes \
@@ -523,10 +825,25 @@ linux_qemu_wait_for_guest() {
     done
 
     echo "Linux VM did not become ready within ${timeout}s. See ${LINUX_QEMU_SERIAL_LOG}" >&2
+    tail -n 40 "${LINUX_QEMU_SERIAL_LOG}" >&2 || true
     exit 1
 }
 
 linux_qemu_ensure_guest_tools() {
+    if linux_qemu_use_baked_guest_init; then
+        LINUX_QEMU_SSH_TIMEOUT_SECONDS="${LINUX_QEMU_GUEST_SETUP_TIMEOUT_SECONDS:-120}" linux_qemu_ssh_run \
+            -F /dev/null \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile="${LINUX_QEMU_KNOWN_HOSTS}" \
+            -i "${LINUX_QEMU_HOST_KEY}" \
+            -p "${VM_SSH_PORT}" \
+            root@"${LINUX_QEMU_GUEST_HOST}" \
+            "bash -lc 'set -Eeuo pipefail; command -v zpool >/dev/null 2>&1; command -v exportfs >/dev/null 2>&1; modprobe zfs >/dev/null 2>&1 || true'" \
+            >/dev/null
+        return
+    fi
+
     LINUX_QEMU_SSH_TIMEOUT_SECONDS="${LINUX_QEMU_GUEST_SETUP_TIMEOUT_SECONDS:-900}" linux_qemu_ssh_run \
         -F /dev/null \
         -o BatchMode=yes \
@@ -537,6 +854,11 @@ linux_qemu_ensure_guest_tools() {
         root@"${LINUX_QEMU_GUEST_HOST}" \
         "bash -lc '
 set -Eeuo pipefail
+
+if command -v zpool >/dev/null 2>&1 && command -v exportfs >/dev/null 2>&1; then
+    modprobe zfs >/dev/null 2>&1 || true
+    exit 0
+fi
 
 if command -v cloud-init >/dev/null 2>&1; then
     cloud-init status --wait >/dev/null 2>&1 || true
@@ -557,6 +879,8 @@ modprobe zfs >/dev/null 2>&1 || true
 }
 
 linux_qemu_ensure_vm_running() {
+    local lock_fd=""
+
     linux_qemu_require_linux
     linux_qemu_init_dirs
     linux_qemu_require_dependencies
@@ -564,7 +888,16 @@ linux_qemu_ensure_vm_running() {
     linux_qemu_download_base_image
     linux_qemu_ensure_host_key
 
+    if command -v flock >/dev/null 2>&1; then
+        exec {lock_fd}>"${LINUX_QEMU_STATE_DIR}/vm.lock"
+        flock "${lock_fd}"
+    fi
+
     if linux_qemu_try_use_shared_vm; then
+        if [[ -n "${lock_fd}" ]]; then
+            flock -u "${lock_fd}" || true
+            eval "exec ${lock_fd}>&-"
+        fi
         return
     fi
 
@@ -574,17 +907,26 @@ linux_qemu_ensure_vm_running() {
         linux_qemu_start_vm || exit 1
     fi
 
-    linux_qemu_wait_for_guest
-    linux_qemu_ensure_guest_tools
+    if ! linux_qemu_bootstrap_complete_for_current_vm; then
+        linux_qemu_wait_for_guest
+        linux_qemu_ensure_guest_tools
+        linux_qemu_import_known_pools
+        linux_qemu_mark_bootstrap_complete
+    fi
+
+    if [[ -n "${lock_fd}" ]]; then
+        flock -u "${lock_fd}" || true
+        eval "exec ${lock_fd}>&-"
+    fi
 }
 
 linux_qemu_guest_exec_raw() {
-    local remote_cmd
+    local remote_args=""
 
     linux_qemu_ensure_vm_running
-    printf -v remote_cmd '%q ' "$@"
+    printf -v remote_args ' %q' "$@"
 
-    ssh \
+    linux_qemu_ssh_run \
         -F /dev/null \
         -o BatchMode=yes \
         -o StrictHostKeyChecking=accept-new \
@@ -592,7 +934,7 @@ linux_qemu_guest_exec_raw() {
         -i "${LINUX_QEMU_HOST_KEY}" \
         -p "${VM_SSH_PORT}" \
         root@"${LINUX_QEMU_GUEST_HOST}" \
-        "${remote_cmd% }"
+        "set -Eeuo pipefail; set --${remote_args}; exec \"\$@\""
 }
 
 linux_qemu_import_known_pools() {
@@ -605,9 +947,14 @@ linux_qemu_import_known_pools() {
         [[ -e "${host_path}" ]] || continue
 
         guest_path="${LINUX_QEMU_HOST_ROOT_MOUNT}${host_path}"
-        import_path="${guest_path}"
-        if [[ ! -b "${host_path}" && ! -c "${host_path}" ]]; then
-            import_path="$(dirname "${guest_path}")"
+        if guest_path="$(linux_qemu_guest_device_for_host_path "${host_path}")"; then
+            import_path="${guest_path}"
+        else
+            guest_path="${LINUX_QEMU_HOST_ROOT_MOUNT}${host_path}"
+            import_path="${guest_path}"
+            if [[ ! -b "${host_path}" && ! -c "${host_path}" ]]; then
+                import_path="$(dirname "${guest_path}")"
+            fi
         fi
 
         linux_qemu_guest_exec_raw bash -lc "
@@ -629,6 +976,5 @@ zfs mount -a >/dev/null 2>&1 || true
 
 linux_qemu_guest_exec() {
     linux_qemu_ensure_vm_running
-    linux_qemu_import_known_pools
     linux_qemu_guest_exec_raw "$@"
 }

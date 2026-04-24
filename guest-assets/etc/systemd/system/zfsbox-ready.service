@@ -1,0 +1,12 @@
+[Unit]
+Description=Mark zfsbox guest ready
+After=systemd-networkd.service ssh.socket zfsbox-guest-init.service
+Wants=systemd-networkd.service ssh.socket zfsbox-guest-init.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/zfsbox-write-ready.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=zfsbox.target

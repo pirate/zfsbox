@@ -3,3 +3,5 @@
 state/
 data/
 data*/
+mnt/
+.tmp-*/
