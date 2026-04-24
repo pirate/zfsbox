@@ -99,7 +99,7 @@ Notes:
 
 - The compose file pulls `ghcr.io/pirate/zfsbox:latest`, which is published for both `linux/amd64` and `linux/arm64`.
 - `docker compose up -d --wait --wait-timeout 90` blocks until the inner guest is healthy and exits with an error if that does not happen before the timeout.
-- The provided Compose service uses `CAP_SYS_ADMIN` so it can mount guest NFS exports at `/mnt/<pool>` inside the container. It does not require `privileged: true`.
+- The provided Compose service uses `CAP_SYS_ADMIN` only so it can mount guest NFS exports at `/mnt/<pool>` inside the container. It does not require `privileged: true`.
 - On Docker Desktop, the first cold `up --wait` usually takes tens of seconds because it boots an inner Linux guest before any ZFS command runs.
 - If you are developing `zfsbox` itself locally, build your own image first and point compose at it:
 
