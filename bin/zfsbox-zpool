@@ -15,11 +15,57 @@ done
 BIN_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
 PROJECT_DIR="$(cd "${BIN_DIR}/.." && pwd)"
 HOST_OS="$(uname -s)"
+STATE_ROOT_DIR="${ZFSBOX_STATE_DIR:-${PROJECT_DIR}/state}"
+MACOS_LIMA_KNOWN_POOL_PATHS_FILE="${STATE_ROOT_DIR}/macos-lima/known-pool-paths.tsv"
 
 if [[ "${HOST_OS}" == "Linux" && -f "${PROJECT_DIR}/scripts/linux-qemu-common.sh" ]]; then
     # shellcheck disable=SC1091
     source "${PROJECT_DIR}/scripts/linux-qemu-common.sh"
 fi
+
+macos_lima_record_known_pool_paths() {
+    local pool="$1"
+    shift
+    local tmp_file
+    local path
+
+    [[ -n "${pool}" ]] || return 0
+    mkdir -p "$(dirname "${MACOS_LIMA_KNOWN_POOL_PATHS_FILE}")"
+    tmp_file="$(mktemp)"
+
+    if [[ -f "${MACOS_LIMA_KNOWN_POOL_PATHS_FILE}" ]]; then
+        awk -F'\t' -v pool="${pool}" '$1 != pool {print}' "${MACOS_LIMA_KNOWN_POOL_PATHS_FILE}" > "${tmp_file}"
+    fi
+
+    for path in "$@"; do
+        [[ -e "${path}" ]] || continue
+        printf '%s\t%s\n' "${pool}" "${path}" >> "${tmp_file}"
+    done
+
+    mv "${tmp_file}" "${MACOS_LIMA_KNOWN_POOL_PATHS_FILE}"
+}
+
+macos_lima_forget_known_pool() {
+    local pool="$1"
+    local tmp_file
+
+    [[ -f "${MACOS_LIMA_KNOWN_POOL_PATHS_FILE}" ]] || return 0
+    tmp_file="$(mktemp)"
+    awk -F'\t' -v pool="${pool}" '$1 != pool {print}' "${MACOS_LIMA_KNOWN_POOL_PATHS_FILE}" > "${tmp_file}"
+    mv "${tmp_file}" "${MACOS_LIMA_KNOWN_POOL_PATHS_FILE}"
+}
+
+macos_lima_rename_known_pool() {
+    local old_pool="$1"
+    local new_pool="$2"
+    local tmp_file
+
+    [[ -f "${MACOS_LIMA_KNOWN_POOL_PATHS_FILE}" ]] || return 0
+    [[ -n "${old_pool}" && -n "${new_pool}" ]] || return 0
+    tmp_file="$(mktemp)"
+    awk -F'\t' -v old_pool="${old_pool}" -v new_pool="${new_pool}" 'BEGIN{OFS="\t"} {if ($1 == old_pool) {$1 = new_pool} print}' "${MACOS_LIMA_KNOWN_POOL_PATHS_FILE}" > "${tmp_file}"
+    mv "${tmp_file}" "${MACOS_LIMA_KNOWN_POOL_PATHS_FILE}"
+}
 
 needs_sync=0
 pool_name=""
@@ -80,7 +126,7 @@ case "${1:-}" in
         ;;
 esac
 
-if [[ "${HOST_OS}" == "Linux" ]]; then
+if [[ "${HOST_OS}" == "Linux" || "${HOST_OS}" == "Darwin" ]]; then
     pool_name="$(zpool_extract_pool_name "${1:-}" "${@:2}")"
     if [[ "${1:-}" == "rename" ]]; then
         rename_target="${3:-}"
@@ -102,16 +148,25 @@ set +e
 status=$?
 set -e
 
-if [[ "${status}" -eq 0 && "${HOST_OS}" == "Linux" ]]; then
-    case "${1:-}" in
-        create|import|add|attach|replace|split)
+if [[ "${status}" -eq 0 ]]; then
+    case "${HOST_OS}:${1:-}" in
+        Linux:create|Linux:import|Linux:add|Linux:attach|Linux:replace|Linux:split)
             linux_qemu_record_known_pool_paths "${pool_name}" "${candidate_paths[@]}"
             ;;
-        destroy)
+        Linux:destroy)
             linux_qemu_forget_known_pool "${pool_name}"
             ;;
-        rename)
+        Linux:rename)
             linux_qemu_rename_known_pool "${pool_name}" "${rename_target}"
+            ;;
+        Darwin:create|Darwin:import|Darwin:add|Darwin:attach|Darwin:replace|Darwin:split)
+            macos_lima_record_known_pool_paths "${pool_name}" "${candidate_paths[@]}"
+            ;;
+        Darwin:destroy)
+            macos_lima_forget_known_pool "${pool_name}"
+            ;;
+        Darwin:rename)
+            macos_lima_rename_known_pool "${pool_name}" "${rename_target}"
             ;;
     esac
 fi

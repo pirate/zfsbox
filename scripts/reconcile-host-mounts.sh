@@ -14,7 +14,6 @@ if [[ -f "${ENV_FILE}" ]]; then
 fi
 
 LIMA_INSTANCE_NAME="${LIMA_INSTANCE_NAME:-${INSTANCE_NAME:-zfsbox-zfs}}"
-MACOS_VZ_STATE_DIR="${STATE_DIR}/macos-vz"
 mkdir -p "${STATE_DIR}"
 
 log() {
@@ -83,6 +82,17 @@ set_mounts_unavailable() {
 print_mount_fallback_notice() {
     local pool="$1"
     local target="$2"
+    local guest_ip_value
+
+    if [[ "${host_os}" == "Darwin" ]]; then
+        printf 'Pool created or updated and exposed via NFS on the Lima guest (%s).\n' "${target}" >&2
+        cat >&2 <<EOF
+Automatic mount at ${target} was skipped because ${mounts_unavailable_reason}.
+To mount it now, run:
+  \$ sudo ${PROJECT_DIR}/scripts/reconcile-host-mounts.sh
+EOF
+        return
+    fi
 
     printf 'Pool created or updated and exposed via NFSv4 at 127.0.0.1:%s:/%s (%s).\n' "${VM_NFS_PORT}" "${pool}" "${target}" >&2
 
@@ -125,29 +135,29 @@ EOF
 
 guest_exec() {
     local script="$1"
+    local script_file
+    local status
 
     if [[ "${host_os}" == "Darwin" ]]; then
-        "${PROJECT_DIR}/scripts/macos-lima-zfs-exec.sh" bash -lc "${script}"
-    else
-        linux_qemu_guest_exec bash -lc "${script}"
+        limactl --log-level=error -y shell "${LIMA_INSTANCE_NAME}" bash -lc "${script}"
+        return
     fi
+
+    linux_qemu_guest_exec bash -lc "${script}"
 }
 
 guest_sudo_exec() {
     local script="$1"
 
     if [[ "${host_os}" == "Darwin" ]]; then
-        "${PROJECT_DIR}/scripts/macos-lima-zfs-exec.sh" bash -lc "${script}"
+        limactl --log-level=error -y shell "${LIMA_INSTANCE_NAME}" sudo bash -lc "${script}"
     else
         guest_exec "${script}"
     fi
 }
 
 ensure_guest_exports() {
-    local host_client_q="$1"
-
-    if [[ "${host_os}" == "Linux" ]]; then
-        guest_sudo_exec "
+    guest_sudo_exec "
 set -Eeuo pipefail
 
 if command -v apt-get >/dev/null 2>&1 && ! command -v exportfs >/dev/null 2>&1; then
@@ -201,42 +211,17 @@ done
 
 mv \"\${tmp_exports}\" /etc/exports.d/zfsbox-hostmounts.exports
 rm -f \"\${tmp_desired}\"
-systemctl enable --now nfs-server >/dev/null 2>&1 || systemctl enable --now nfs-kernel-server >/dev/null 2>&1 || true
+modprobe nfsd >/dev/null 2>&1 || true
+mkdir -p /proc/fs/nfsd
+mountpoint -q /proc/fs/nfsd || mount -t nfsd nfsd /proc/fs/nfsd || true
 exportfs -ra
-"
-        return 0
-    fi
 
-    guest_sudo_exec "
-set -Eeuo pipefail
-
-host_client=${host_client_q}
-
-if command -v apt-get >/dev/null 2>&1 && ! command -v exportfs >/dev/null 2>&1; then
-    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update >/dev/null 2>&1
-    env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y nfs-kernel-server >/dev/null 2>&1
+if [[ \"${host_os}\" == \"Darwin\" ]]; then
+    rpc.nfsd 0 >/dev/null 2>&1 || true
+    rpc.nfsd -N 3 8 >/dev/null 2>&1
+else
+    systemctl enable --now nfs-server >/dev/null 2>&1 || systemctl enable --now nfs-kernel-server >/dev/null 2>&1 || true
 fi
-
-mkdir -p /etc/exports.d
-tmp_file=\$(mktemp)
-
-zfs list -H -o name,mountpoint,mounted -t filesystem -d 0 | while IFS=\$'\\t' read -r name mountpoint mounted; do
-    case \"\${mountpoint}\" in
-        legacy|none|-|'')
-            continue
-            ;;
-    esac
-
-    if [[ \"\${mounted}\" != yes ]]; then
-        continue
-    fi
-
-    printf '%s %s(rw,sync,no_subtree_check,no_root_squash,insecure,crossmnt)\\n' \"\${mountpoint}\" \"\${host_client}\"
-done > \"\${tmp_file}\"
-
-mv \"\${tmp_file}\" /etc/exports.d/zfsbox-hostmounts.exports
-systemctl enable --now nfs-server >/dev/null 2>&1 || true
-exportfs -ra
 "
 }
 
@@ -300,6 +285,18 @@ ensure_host_mount_privileges() {
         return
     fi
 
+    if [[ "${host_os}" == "Darwin" ]]; then
+        if [[ "${EUID}" -eq 0 ]]; then
+            return
+        fi
+        if ! sudo -n true 2>/dev/null; then
+            if ! sudo -v; then
+                set_mounts_unavailable "sudo is required to mount NFS volumes on macOS"
+            fi
+        fi
+        return
+    fi
+
     if [[ "${host_os}" == "Linux" && "${EUID}" -eq 0 ]]; then
         if ! host_has_cap_sys_admin; then
             set_mounts_unavailable "CAP_SYS_ADMIN is not available"
@@ -358,7 +355,7 @@ mount_pool() {
             ensure_mount_target "${target}"
         fi
 
-        host_root_run /sbin/mount_nfs -o vers=3,tcp,nolocks "${source}" "${target}"
+        host_root_run /sbin/mount_nfs -o vers=4,tcp,port=2049 "${source}" "${target}"
     else
         target="/mnt/${pool}"
         source="${guest_ip}:/${pool}"
@@ -448,7 +445,7 @@ if [[ -z "${host_client_ip}" ]]; then
 fi
 
 if [[ "${host_os}" == "Darwin" ]]; then
-    guest_ip="${GUEST_FIXED_IP:-192.168.64.254}"
+    guest_ip="$(guest_exec "ip -4 route get ${host_client_ip} | awk '{for (i = 1; i <= NF; i++) if (\$i == \"src\") {print \$(i + 1); exit}}'" | tr -d '[:space:]')"
 else
     guest_ip="${LINUX_QEMU_GUEST_HOST:-127.0.0.1}"
 fi
