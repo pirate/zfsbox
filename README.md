@@ -381,7 +381,7 @@ If you publish `127.0.0.1:12049:12049`, the outer host can mount the same pool t
 - https://docs.zfsbootmenu.org/en/v3.1.x/
 - https://github.com/whoschek/bzfs
 - https://github.com/jonmatifa/zfsmanager
-- https://github.com/pirate/zfs.wizard
+- https://github.com/pirate/zfsify ⭐️ in-place convert Ubuntu on EXT4 `/` to ZFS
 
 ## 🗺 Roadmap
 
