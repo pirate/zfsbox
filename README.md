@@ -9,7 +9,7 @@ It allows you to run ZFS on macOS, Linux, or in Docker containers without having
 ## ✨ Features
 
 - Host-side `zpool` and `zfs` wrappers
-- macOS-backed pools using block devices or files under `${HOME}`, `/Volumes`, or `/dev`
+- macOS-backed pools using files under `${HOME}` or `/Volumes` (physical disk passthrough is not supported by the current runner)
 - Linux-backed pools using block devices or files anywhere under `/` or `/dev`.
 - automatic host mounts at `/Volumes/<pool>` on macOS
 - automatic mounts at `/mnt/<pool>` on Linux and inside the provided Docker service
@@ -17,6 +17,8 @@ It allows you to run ZFS on macOS, Linux, or in Docker containers without having
 - work inside Docker, Docker Compose, Docker Desktop, and Kubernetes as well (on Linux, macOS, and Windows hosts *without* needing ZFS installed in Docker VM)
 
 ## 🚀 Quick Start
+
+On macOS, install a released version of [Lima](https://lima-vm.io/docs/installation/) and make sure `limactl` and `python3` are available in `PATH`. File-backed pools do not require a custom Lima build. The `truncate` examples below use GNU coreutils; on macOS, install [coreutils](https://formulae.brew.sh/formula/coreutils) and use `gtruncate` in place of `truncate`.
 
 ### 1. Load the `zpool` and `zfs` command aliases (optional)
 
@@ -31,23 +33,21 @@ This points `zfs` and `zpool` in the current shell to `./bin/zfsbox-zfs` and `./
 
 (Not strictly necessary, you can also run `./bin/zfsbox-zpool ...` & `./bin/zfsbox-zfs ...` directly)
 
-### 2. Create a backing file on the host (optional)
+### 2. Create a backing file on the host
 
 ```bash
 truncate -s 10G ~/Desktop/testpool.zpool
 ```
 
-This is only needed if you want to use a file to store pool data (recommended) instead of a raw block device like `/dev/diskN`.
+This quick start uses a file to store pool data. On macOS, keep it under `${HOME}` or `/Volumes`, which are shared with the Lima guest by default. Use a new filename: `truncate` can resize an existing file.
 
 ### 3. Create a pool
 
 ```bash
-zpool create test ~/Desktop/testpool.zpool   # using a file to store the pool data
-# or
-zpool create test /dev/disk8 ...             # using real disk(s) for the pool vdevs
+zpool create test ~/Desktop/testpool.zpool
 ```
 
-On macOS, the file-backed path above works with normal Lima releases. Raw host block devices like `/dev/diskN` or `/dev/rdiskN` need a `limactl` build that includes Lima PR [`#4866`](https://github.com/lima-vm/lima/pull/4866); see the macOS section below for the PATH-based install flow.
+On macOS, use file-backed pools only. Raw host devices such as `/dev/diskN` and `/dev/rdiskN` are not supported by the current `zfsbox` runner; changing the Lima version alone does not enable them. See the macOS architecture section below for details.
 
 On macOS and Linux, the first run may request `sudo` permissions.
 Root permissions are used to mount pool roots under `/Volumes` or `/mnt`; the `zpool` / `zfs` commands themselves stay rootless if you do not need host mounts.
@@ -209,30 +209,11 @@ This is the native macOS host path. `zfsbox` uses Lima directly with `vz`, `virt
 
 The tradeoff is straightforward: this keeps the macOS host clean and avoids any host-side ZFS install, but it means backing files and visible paths have to live inside the mounted path set. Host-visible mounts are implemented by exporting guest mountpoints back to macOS and mounting them at `/Volumes/<pool>`, so mount reconciliation can trigger Touch ID or `sudo` re-auth when macOS needs to re-establish those mounts.
 
-**Using Lima PR `#4866` for raw `/dev/diskN` passthrough**
+**Physical disk passthrough is not supported by this runner**
 
-Released Lima builds are enough for file-backed pools, but raw host block-device passthrough on macOS currently needs Lima PR [`#4866`](https://github.com/lima-vm/lima/pull/4866). That PR adds `limactl start --block-device=/dev/diskN` and the top-level `blockDevices:` config field for `vmType: vz`, and it exposes each attached device in the guest as a deterministic virtio block path like `/dev/disk/by-id/virtio-disk4`.
+The current macOS runner validates absolute paths against its filesystem shares (`${HOME}` and `/Volumes` by default), so `/dev/diskN` and `/dev/rdiskN` are rejected by default. It does not configure Lima `blockDevices` or translate host disk paths to guest device paths. Adding `/dev` to `LIMA_VM_MOUNTS` is not a substitute for block-device attachment, and installing a different `limactl` does not implement the missing integration.
 
-`zfsbox` does not hardcode any Lima path. It just runs `limactl` from `PATH`, so the easiest way to test that branch is to put your local PR build first in `PATH` before you run `zfsbox`:
-
-```bash
-git clone https://github.com/lima-vm/lima.git
-cd lima
-git fetch origin pull/4866/head:zfsbox-vz-block-device-sharing
-git checkout zfsbox-vz-block-device-sharing
-make native
-
-export PATH="$PWD/_output/bin:$PATH"
-limactl --version
-cd /path/to/zfsbox
-PATH="/path/to/lima/_output/bin:$PATH" ./bin/zfsbox-zpool create test /dev/disk4
-```
-
-Notes:
-
-- `make native` builds `limactl`, the native guest agent, and the bundled templates that `zfsbox` expects.
-- Keep the PATH override scoped to the shell or command if you still want Homebrew Lima installed side-by-side.
-- Expect a narrow macOS `sudo` / Touch ID prompt when opening `/dev/diskN`; the PR keeps the main Lima VM process unprivileged and only escalates the helper that opens the block device.
+Do not build or use the old Lima PR [`#4866`](https://github.com/lima-vm/lima/pull/4866) for this setup. It was [reverted in `#5113`](https://github.com/lima-vm/lima/pull/5113) after a [privileged-helper security flaw was reported](https://github.com/lima-vm/lima/issues/5112). The replacement, [`#5117`](https://github.com/lima-vm/lima/pull/5117), was included in the [`v2.3.0-beta.1` prerelease](https://github.com/lima-vm/lima/releases/tag/v2.3.0-beta.1), but upstream Lima support is not verified `zfsbox` support. Physical disks need explicit integration and end-to-end validation before a `zfsbox` setup recipe can be provided. Use the file-backed quick start above instead.
 
 **Mode-specific config**
 
@@ -344,7 +325,7 @@ The tradeoff is that Docker mode is convenient and self-contained, but it adds a
   - `ZFSBOX_SKIP_HOST_MOUNTS=1`: skip automatic mounts inside the container and just manage pools/datasets.
 - Common optional YAML additions when you need them:
   - `/dev/kvm:/dev/kvm` on Linux Docker hosts for guest acceleration.
-  - raw disk device mappings if you want to hand real block devices to `zpool create` instead of files.
+  - on Linux Docker hosts, raw disk device mappings if you want to hand real block devices to `zpool create` instead of files. This is not a macOS host-disk passthrough recipe; use file-backed pools on macOS.
 
 **Performance and tunables**
 
